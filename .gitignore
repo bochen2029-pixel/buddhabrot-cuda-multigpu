@@ -1,0 +1,32 @@
+# Build artifacts
+buddhabrot
+buddhabrot.exe
+*.exp
+*.lib
+*.obj
+*.o
+
+# Output renders (regenerable, often large)
+*.png
+*.jpg
+!examples/*.jpg
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
