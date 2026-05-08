@@ -1068,9 +1068,13 @@ int main(int argc, char** argv) {
     // with inverse-probability weighting. The kernel takes nullptr alias_table
     // when IS is disabled, falling back to the uniform path.
     // -----------------------------------------------------------------------
-    unsigned int*       d_alias_table     = nullptr;
-    float*              d_alias_threshold = nullptr;
-    unsigned int*       d_imap_data       = nullptr;
+    // Per-device IMap arrays. On consumer cards (RTX 4090 etc.) P2P access is
+    // disabled by NVIDIA driver, so a single device-0 allocation cannot be
+    // read by kernels running on devices 1..N. Allocate independent copies on
+    // every device that participates in the render.
+    std::vector<unsigned int*> d_alias_table_per_dev;
+    std::vector<float*>        d_alias_threshold_per_dev;
+    std::vector<unsigned int*> d_imap_data_per_dev;
     unsigned long long  imap_total_mass   = 0ULL;
     unsigned int        imap_res_loaded   = 0u;
 
@@ -1161,13 +1165,22 @@ int main(int argc, char** argv) {
             alias[s] = s;
         }
 
-        check(cudaSetDevice(0), "set dev 0 imap upload");
-        check(cudaMalloc(&d_alias_table,     n_cells * sizeof(unsigned int)), "alias_table malloc");
-        check(cudaMalloc(&d_alias_threshold, n_cells * sizeof(float)),        "alias_threshold malloc");
-        check(cudaMalloc(&d_imap_data,       n_cells * sizeof(unsigned int)), "imap_data malloc");
-        check(cudaMemcpy(d_alias_table,     alias.data(),     n_cells * sizeof(unsigned int), cudaMemcpyHostToDevice), "memcpy alias");
-        check(cudaMemcpy(d_alias_threshold, threshold.data(), n_cells * sizeof(float),        cudaMemcpyHostToDevice), "memcpy threshold");
-        check(cudaMemcpy(d_imap_data,       imap_host.data(), n_cells * sizeof(unsigned int), cudaMemcpyHostToDevice), "memcpy imap");
+        // Allocate IMap+alias tables on EVERY device. Total cost: n_devices ×
+        // ~12 MB (1M cells × (uint32 alias + float threshold + uint32 imap))
+        // = trivial (e.g. 72 MB across 6 devices). Necessary on consumer cards
+        // where P2P is disabled.
+        d_alias_table_per_dev.assign(n_devices, nullptr);
+        d_alias_threshold_per_dev.assign(n_devices, nullptr);
+        d_imap_data_per_dev.assign(n_devices, nullptr);
+        for (int d = 0; d < n_devices; d++) {
+            check(cudaSetDevice(d), "set dev imap upload");
+            check(cudaMalloc(&d_alias_table_per_dev[d],     n_cells * sizeof(unsigned int)), "alias_table malloc");
+            check(cudaMalloc(&d_alias_threshold_per_dev[d], n_cells * sizeof(float)),        "alias_threshold malloc");
+            check(cudaMalloc(&d_imap_data_per_dev[d],       n_cells * sizeof(unsigned int)), "imap_data malloc");
+            check(cudaMemcpy(d_alias_table_per_dev[d],     alias.data(),     n_cells * sizeof(unsigned int), cudaMemcpyHostToDevice), "memcpy alias");
+            check(cudaMemcpy(d_alias_threshold_per_dev[d], threshold.data(), n_cells * sizeof(float),        cudaMemcpyHostToDevice), "memcpy threshold");
+            check(cudaMemcpy(d_imap_data_per_dev[d],       imap_host.data(), n_cells * sizeof(unsigned int), cudaMemcpyHostToDevice), "memcpy imap");
+        }
 
         fprintf(stderr, "IMap loaded     : %s  (%ux%u, total_mass=%llu)\n",
             imap_path.c_str(), imap_res_loaded, imap_res_loaded,
@@ -1496,7 +1509,7 @@ int main(int argc, char** argv) {
                                 ^ (L                   * 0x9E3779B97F4A7C15ULL);
                 buddhabrot_kernel<<<blocks_per_launch, threads_per_block, 0, streams[d]>>>(
                     d_hist[d], local_P,
-                    d_alias_table, d_alias_threshold, d_imap_data,
+                    d_alias_table_per_dev[d], d_alias_threshold_per_dev[d], d_imap_data_per_dev[d],
                     imap_total_mass, imap_res_loaded,
                     min_iter_r_main, min_iter_g_main, min_iter_b_main);
             }
@@ -1577,9 +1590,11 @@ int main(int argc, char** argv) {
 
     // Cleanup
     if (d_staging) cudaFree(d_staging);
-    if (d_alias_table)     cudaFree(d_alias_table);
-    if (d_alias_threshold) cudaFree(d_alias_threshold);
-    if (d_imap_data)       cudaFree(d_imap_data);
+    for (int d = 0; d < (int)d_alias_table_per_dev.size(); d++) {
+        if (d_alias_table_per_dev[d])     { cudaSetDevice(d); cudaFree(d_alias_table_per_dev[d]); }
+        if (d_alias_threshold_per_dev[d]) { cudaSetDevice(d); cudaFree(d_alias_threshold_per_dev[d]); }
+        if (d_imap_data_per_dev[d])       { cudaSetDevice(d); cudaFree(d_imap_data_per_dev[d]); }
+    }
     for (int d = 0; d < n_devices; d++) {
         check(cudaSetDevice(d), "set device free");
         cudaFree(d_hist[d]);
