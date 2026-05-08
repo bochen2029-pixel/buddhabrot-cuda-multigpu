@@ -9,9 +9,10 @@
 #   5. Watchdog fires SIGUSR1 at T-300s; main.cu finishes round, saves, exits
 #   6. Background HF sync uploads each checkpoint as it lands
 #
-# Banned-pattern guard per CLAUDE.md §B1.
-if grep -qE -- '--target-[rgb]' "$0"; then
-    echo "ERROR: --target-r/g/b detected in this script. Banned per CLAUDE.md §B1." >&2
+# Banned-pattern guard per CLAUDE.md §B1. Skip comments and the guard
+# itself so we don't false-positive on the regex/error-message strings.
+if grep -v '^[[:space:]]*#' "$0" | grep -v 'grep -qE' | grep -qE -- '--targe[t]-[rgb]'; then
+    echo "ERROR: banned flag detected in this script. See CLAUDE.md section B1." >&2
     exit 1
 fi
 
