@@ -15,7 +15,8 @@ set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/bochen2029-pixel/buddhabrot-cuda-multigpu.git}"
 REPO_DIR="${REPO_DIR:-$HOME/buddhabrot-cuda-multigpu}"
-SUBDIR="cuda-render-16k"
+# Renderer files are at the repo root, not in a subdirectory.
+SUBDIR=""
 
 echo "============================================================"
 echo "Hyperbolic.xyz bootstrap — Buddhabrot CUDA renderer"
@@ -54,7 +55,9 @@ else
     git clone "$REPO_URL" "$REPO_DIR"
     cd "$REPO_DIR"
 fi
-cd "$SUBDIR"
+if [ -n "$SUBDIR" ] && [ -d "$SUBDIR" ]; then
+    cd "$SUBDIR"
+fi
 echo "[3/7] In: $(pwd)"
 
 # 4. Install Python deps for HF sync (background)
@@ -112,7 +115,11 @@ echo "============================================================"
 echo "Bootstrap complete."
 echo
 echo "To launch the production render:"
-echo "  cd $REPO_DIR/$SUBDIR"
+if [ -n "$SUBDIR" ]; then
+    echo "  cd $REPO_DIR/$SUBDIR"
+else
+    echo "  cd $REPO_DIR"
+fi
 echo "  export HF_TOKEN=<your_token>            # optional, for background sync"
 echo "  ./run-cloud-hyperbolic.sh"
 echo
