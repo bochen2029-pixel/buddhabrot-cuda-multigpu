@@ -36,7 +36,66 @@
 #include <string>
 #include <chrono>
 #include <algorithm>
+#include <random>
+#include <atomic>
+#if defined(__unix__) || defined(__APPLE__)
+#include <signal.h>
+#endif
 #include "lodepng.h"
+
+// Graceful-terminate flag — set by SIGUSR1 (Linux/cloud only). Watchdog sends
+// SIGUSR1 a few minutes before the hard wallclock cap; the render loop checks
+// at every round boundary, finishes the current round, saves, and exits.
+// Windows has no equivalent path; the flag stays zero on Win32 so behavior is
+// unchanged there.
+static std::atomic<int> g_terminate_requested(0);
+#if defined(__unix__) || defined(__APPLE__)
+extern "C" void buddhabrot_sigusr1_handler(int /*sig*/) {
+    g_terminate_requested.store(1);
+}
+#endif
+
+// Integer-precision factor for histogram weights. Uniform-mode increment
+// represents 1.0 as HIST_SCALE; IS-mode increment is round(HIST_SCALE / p(c)).
+// Histograms are uint64 (4.83 GB at 16K) to absorb any IS weight without
+// overflow. Trim values are ratio-invariant across SCALE so canonical 0.2673
+// etc. continue to work.
+static constexpr unsigned long long HIST_SCALE = 1000ULL;
+
+// -----------------------------------------------------------------------------
+// §B7 RAW histogram dump + resume-from header. 128-byte fixed-layout struct
+// written at the start of <output>.bin files. Allows crash recovery, RAW format
+// preservation for re-grading, and (v1.1) spot-instance resumption.
+// Field order chosen so natural C struct alignment lands at exactly 128 bytes.
+// Offsets called out in comments so a reader can `od -An -t u8 -j NN -N 8` to
+// pull individual fields without parsing the full struct.
+// See cloud_render_plan.md "RAW histogram format and resume protocol".
+// -----------------------------------------------------------------------------
+struct HistHeader {
+    char     magic[4];               // offset 0   "BHRA"
+    unsigned int version;            // offset 4   1
+    unsigned int width;              // offset 8
+    unsigned int height;             // offset 12
+    unsigned int reserved0;          // offset 16
+    unsigned int reserved_pad0;      // offset 20  (explicit padding for hist_count's 8-byte alignment)
+    unsigned long long hist_count;   // offset 24  pixels*3 + 3, for sanity match
+    unsigned long long samples_done; // offset 32  total trajectories accumulated
+    unsigned long long base_seed_used; // offset 40
+    double view_center_x;            // offset 48
+    double view_center_y;            // offset 56
+    double zoom;                     // offset 64
+    double rotation_deg;             // offset 72
+    double sample_center_x;          // offset 80
+    double sample_center_y;          // offset 88
+    double sample_radius;            // offset 96
+    unsigned int iter_r;             // offset 104
+    unsigned int iter_g;             // offset 108
+    unsigned int iter_b;             // offset 112
+    unsigned int hist_scale;         // offset 116  (HIST_SCALE used)
+    unsigned int imap_used;          // offset 120  1 if --imap was active, 0 otherwise
+    char     imap_marker[4];         // offset 124  first 4 bytes of imap.bin (poor-man's sanity check)
+};                                   // total 128 bytes
+static_assert(sizeof(HistHeader) == 128, "HistHeader must be exactly 128 bytes");
 
 // -----------------------------------------------------------------------------
 // Params — passed by value into every kernel launch.
@@ -161,13 +220,14 @@ __device__ __forceinline__ int2 world_to_pixel(float2 p, const Params& P) {
 }
 
 __device__ __forceinline__ void increment_pixel_channel(
-    unsigned int* histogram, int2 pixel, unsigned int channel, const Params& P)
+    unsigned long long* histogram, int2 pixel, unsigned int channel,
+    unsigned long long weight, const Params& P)
 {
     if (pixel.x < 0 || pixel.y < 0 || pixel.x >= P.width || pixel.y >= P.height) return;
     unsigned int pixels  = (unsigned int)P.width * (unsigned int)P.height;
     unsigned int idx     = ((unsigned int)pixel.y * (unsigned int)P.width
                           + (unsigned int)pixel.x) * 3u + channel;
-    unsigned int new_val = atomicAdd(&histogram[idx], 1u) + 1u;
+    unsigned long long new_val = atomicAdd(&histogram[idx], weight) + weight;
     unsigned int max_idx = pixels * 3u + channel;
     atomicMax(&histogram[max_idx], new_val);
 }
@@ -187,26 +247,85 @@ __device__ __forceinline__ unsigned int count_iterations(
 }
 
 __device__ __forceinline__ void accumulate_orbit(
-    unsigned int* histogram,
+    unsigned long long* histogram,
     float2 z0, float ex, float ey, float2 c,
-    unsigned int iterations, const Params& P)
+    unsigned int iterations, unsigned long long weight, const Params& P)
 {
     float2 z = z0;
     for (unsigned int i = 0u; i < iterations; i++) {
         z = complex_pow(z, ex, ey);
         z.x += c.x; z.y += c.y;
         int2 pixel = world_to_pixel(z, P);
-        if (i <= P.max_iter_1) increment_pixel_channel(histogram, pixel, 0u, P);
-        if (i <= P.max_iter_2) increment_pixel_channel(histogram, pixel, 1u, P);
-        if (i <= P.max_iter_3) increment_pixel_channel(histogram, pixel, 2u, P);
+        if (i <= P.max_iter_1) increment_pixel_channel(histogram, pixel, 0u, weight, P);
+        if (i <= P.max_iter_2) increment_pixel_channel(histogram, pixel, 1u, weight, P);
+        if (i <= P.max_iter_3) increment_pixel_channel(histogram, pixel, 2u, weight, P);
     }
 }
 
 // -----------------------------------------------------------------------------
-// Compute kernel — uint64 seed mixing for collision-free thread streams at
-// arbitrary scale (validated up to 10¹¹ threads across one cloud run).
+// IS draw via Vose alias method on the IMap. Each thread:
+//   1. Picks a cell uniformly from [0, n_cells)
+//   2. Compares a uniform [0,1) against the cell's threshold; if below, picks
+//      the cell, otherwise picks alias[cell].
+//   3. Jitters uniformly inside the chosen cell to get c.
+//   4. Computes p(c) = imap[cell] / total_mass / cell_area (the IS density).
+//
+// Returns c via the output param; p(c) via *p_out.
 // -----------------------------------------------------------------------------
-__global__ void buddhabrot_kernel(unsigned int* __restrict__ histogram, const Params P) {
+__device__ __forceinline__ float2 random_complex_imap(
+    unsigned int* state,
+    const unsigned int* __restrict__ alias_table,
+    const float* __restrict__ alias_threshold,
+    const unsigned int* __restrict__ imap_data,
+    unsigned long long total_mass,
+    unsigned int imap_resolution,
+    unsigned int n_cells,
+    float disk_cx, float disk_cy, float disk_r,
+    double* p_out)
+{
+    unsigned int u_idx = xorshift32(state) % n_cells;
+    float u_thr = random_f32_unit(state);
+    unsigned int cell_idx = (u_thr < alias_threshold[u_idx]) ? u_idx : alias_table[u_idx];
+
+    unsigned int cy = cell_idx / imap_resolution;
+    unsigned int cx = cell_idx - cy * imap_resolution;
+
+    float jx = random_f32_unit(state);
+    float jy = random_f32_unit(state);
+
+    float u = ((float)cx + jx) / (float)imap_resolution;  // [0,1)
+    float v = ((float)cy + jy) / (float)imap_resolution;
+
+    float2 c;
+    c.x = (u - 0.5f) * 2.0f * disk_r + disk_cx;
+    c.y = (v - 0.5f) * 2.0f * disk_r + disk_cy;
+
+    // p(c) = (imap[cell] / total_mass) / cell_area
+    // cell_area = (2*disk_r)^2 / n_cells
+    double cell_area = (double)(2.0f * disk_r) * (double)(2.0f * disk_r) / (double)n_cells;
+    double cell_prob = (double)imap_data[cell_idx] / (double)total_mass;
+    *p_out = cell_prob / cell_area;
+    return c;
+}
+
+// -----------------------------------------------------------------------------
+// Compute kernel — uint64 seed mixing + uint64 weighted histogram.
+// When `alias_table != nullptr`, samples c via Bitterli IS and weights orbit
+// contributions by HIST_SCALE / p(c). Otherwise uniform-on-disk with weight =
+// HIST_SCALE (the original behavior, scaled).
+// -----------------------------------------------------------------------------
+__global__ void buddhabrot_kernel(
+    unsigned long long* __restrict__ histogram,
+    const Params P,
+    const unsigned int* __restrict__ alias_table,
+    const float* __restrict__ alias_threshold,
+    const unsigned int* __restrict__ imap_data,
+    unsigned long long total_mass,
+    unsigned int imap_resolution,
+    unsigned int min_iter_r,
+    unsigned int min_iter_g,
+    unsigned int min_iter_b)
+{
     unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
 
     // 64-bit input through PCG hash → 32-bit xorshift state. Multiplying gid
@@ -220,12 +339,40 @@ __global__ void buddhabrot_kernel(unsigned int* __restrict__ histogram, const Pa
     if (P.max_iter_2 > max_iter) max_iter = P.max_iter_2;
     if (P.max_iter_3 > max_iter) max_iter = P.max_iter_3;
 
+    bool is_mode = (alias_table != nullptr);
+    unsigned int n_cells = imap_resolution * imap_resolution;
+
+    // Apply min-iter as channel-cap masks: if escape_iter < min_iter[ch], that
+    // channel's accumulate_orbit calls are gated. Cheapest implementation:
+    // shadow max_iter_* in a local Params copy when escape is below the floor.
+    Params local_P = P;
+
     float2 z0 = make_float2(P.initial_z_x, P.initial_z_y);
 
     for (unsigned int s = 0u; s < P.samples_per_thread; s++) {
-        float2 c = random_complex_delta(&seed,
-                       P.sample_center_x, P.sample_center_y,
-                       P.sample_radius, P.uniform_sample_distribution);
+        float2 c;
+        unsigned long long weight;
+        if (is_mode) {
+            double p_c;
+            c = random_complex_imap(&seed,
+                    alias_table, alias_threshold, imap_data,
+                    total_mass, imap_resolution, n_cells,
+                    P.sample_center_x, P.sample_center_y, P.sample_radius,
+                    &p_c);
+            // weight = HIST_SCALE / p(c). Round to nearest integer.
+            // p(c) is bounded below by smallest nonzero imap cell density;
+            // worst-case weight on a 1024^2 IMap with total_mass ~4e9 and a
+            // single-hit cell (mass=1, cell_area~2.4e-5) is ~10^5. uint64
+            // hist absorbs any per-pixel sum out of this.
+            double w = (double)HIST_SCALE / p_c;
+            weight = (unsigned long long)(w + 0.5);
+            if (weight == 0ULL) weight = 1ULL;
+        } else {
+            c = random_complex_delta(&seed,
+                    P.sample_center_x, P.sample_center_y,
+                    P.sample_radius, P.uniform_sample_distribution);
+            weight = HIST_SCALE;
+        }
 
         unsigned int i = count_iterations(z0, P.exponent_x, P.exponent_y, c, max_iter, P.bailout_radius_sq);
 
@@ -233,7 +380,14 @@ __global__ void buddhabrot_kernel(unsigned int* __restrict__ histogram, const Pa
         bool anti   = (P.anti != 0);
         if (inside != anti) continue;
 
-        accumulate_orbit(histogram, z0, P.exponent_x, P.exponent_y, c, i, P);
+        // Apply min-iter channel gating via local_P (per-thread mutation OK).
+        local_P.max_iter_1 = (i >= min_iter_r) ? P.max_iter_1 : 0u;
+        local_P.max_iter_2 = (i >= min_iter_g) ? P.max_iter_2 : 0u;
+        local_P.max_iter_3 = (i >= min_iter_b) ? P.max_iter_3 : 0u;
+        // If all three channels are gated off, skip the orbit entirely.
+        if (local_P.max_iter_1 == 0u && local_P.max_iter_2 == 0u && local_P.max_iter_3 == 0u) continue;
+
+        accumulate_orbit(histogram, z0, P.exponent_x, P.exponent_y, c, i, weight, local_P);
     }
 }
 
@@ -244,8 +398,8 @@ __global__ void buddhabrot_kernel(unsigned int* __restrict__ histogram, const Pa
 // `compute_max_kernel` rebuilds those tail slots from the merged pixel data.
 // -----------------------------------------------------------------------------
 __global__ void sum_pixels_kernel(
-    unsigned int* __restrict__ dest,
-    const unsigned int* __restrict__ src,
+    unsigned long long* __restrict__ dest,
+    const unsigned long long* __restrict__ src,
     unsigned int n_pixel_words)
 {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -254,7 +408,7 @@ __global__ void sum_pixels_kernel(
 }
 
 __global__ void compute_max_kernel(
-    unsigned int* __restrict__ hist,
+    unsigned long long* __restrict__ hist,
     unsigned int pixels)
 {
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -265,6 +419,60 @@ __global__ void compute_max_kernel(
 }
 
 // -----------------------------------------------------------------------------
+// Importance-map construction kernel — Phase 1 of Bitterli importance sampling.
+//
+// For each thread: take uniform-on-disk samples of c, run the orbit, and on
+// escape add `orbit_length` (linear, per Bitterli 2014) into the IMap cell that
+// contains c. The resulting IMap[N×N] approximates the density of long-orbit
+// c-values across the disk and feeds Phase 2's alias-method IS sampler.
+//
+// IMap covers a square [-sample_radius, +sample_radius]^2 centered at
+// (sample_center). Cells outside the inscribed disk stay at 0 (never sampled).
+// -----------------------------------------------------------------------------
+__global__ void imap_pass_kernel(
+    unsigned int* __restrict__ imap,
+    const Params P,
+    unsigned int imap_resolution,
+    unsigned int imap_iter_cap)
+{
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned long long s64 = P.seed_64 ^ ((unsigned long long)gid * 0x9E3779B97F4A7C15ULL);
+    unsigned int seed = pcg_hash_64(s64);
+    if (seed == 0u) seed = 1u;
+
+    float2 z0 = make_float2(P.initial_z_x, P.initial_z_y);
+    float inv_box_size = 0.5f / P.sample_radius;  // dx in [-r,+r] -> u in [0,1]
+
+    for (unsigned int s = 0u; s < P.samples_per_thread; s++) {
+        float2 c = random_complex_delta(&seed,
+                       P.sample_center_x, P.sample_center_y,
+                       P.sample_radius, P.uniform_sample_distribution);
+
+        unsigned int i = count_iterations(z0, P.exponent_x, P.exponent_y,
+                            c, imap_iter_cap, P.bailout_radius_sq);
+
+        bool inside = (i >= imap_iter_cap);
+        bool anti   = (P.anti != 0);
+        if (inside != anti) continue;
+
+        float dx = c.x - P.sample_center_x;
+        float dy = c.y - P.sample_center_y;
+        float u = dx * inv_box_size + 0.5f;
+        float v = dy * inv_box_size + 0.5f;
+        if (u < 0.0f || u >= 1.0f || v < 0.0f || v >= 1.0f) continue;
+
+        unsigned int cx = (unsigned int)(u * (float)imap_resolution);
+        unsigned int cy = (unsigned int)(v * (float)imap_resolution);
+        if (cx >= imap_resolution) cx = imap_resolution - 1u;
+        if (cy >= imap_resolution) cy = imap_resolution - 1u;
+        unsigned int cell_idx = cy * imap_resolution + cx;
+
+        atomicAdd(&imap[cell_idx], i);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Tonemap kernel — port of render.wgsl fs_main, GPU byte-swap to PNG big-endian.
 // -----------------------------------------------------------------------------
 __device__ __forceinline__ uint16_t bswap16(uint16_t v) {
@@ -272,7 +480,7 @@ __device__ __forceinline__ uint16_t bswap16(uint16_t v) {
 }
 
 __global__ void tonemap_kernel(
-    const unsigned int* __restrict__ histogram,
+    const unsigned long long* __restrict__ histogram,
     uint16_t* __restrict__ out,
     const Params P)
 {
@@ -283,21 +491,24 @@ __global__ void tonemap_kernel(
     unsigned int pixels   = (unsigned int)P.width * (unsigned int)P.height;
     unsigned int hist_idx = (y * (unsigned)P.width + x) * 3u;
 
-    float r_count = (float)histogram[hist_idx + 0u];
-    float g_count = (float)histogram[hist_idx + 1u];
-    float b_count = (float)histogram[hist_idx + 2u];
+    // uint64 → double cast for tonemap arithmetic. fp64 has 53 bits of
+    // mantissa, so up to ~9e15 represents exactly; well within budget.
+    double r_count = (double)histogram[hist_idx + 0u];
+    double g_count = (double)histogram[hist_idx + 1u];
+    double b_count = (double)histogram[hist_idx + 2u];
 
     // Per-channel trim: multiplier on the effective max for tone-grading.
     // trim < 1 brightens that channel (lower effective max → higher t).
-    // trim = 1 is the WGSL behavior.
+    // trim = 1 is the WGSL behavior. The HIST_SCALE factor cancels because
+    // both count and max carry it.
     unsigned int max_base = pixels * 3u;
-    float r_max = fmaxf((float)histogram[max_base + 0u] * P.trim_r, P.normalization_floor);
-    float g_max = fmaxf((float)histogram[max_base + 1u] * P.trim_g, P.normalization_floor);
-    float b_max = fmaxf((float)histogram[max_base + 2u] * P.trim_b, P.normalization_floor);
+    double r_max = fmax((double)histogram[max_base + 0u] * (double)P.trim_r, (double)P.normalization_floor);
+    double g_max = fmax((double)histogram[max_base + 1u] * (double)P.trim_g, (double)P.normalization_floor);
+    double b_max = fmax((double)histogram[max_base + 2u] * (double)P.trim_b, (double)P.normalization_floor);
 
-    float rt = fminf(fmaxf(r_count / r_max, 0.0f), 1.0f);
-    float gt = fminf(fmaxf(g_count / g_max, 0.0f), 1.0f);
-    float bt = fminf(fmaxf(b_count / b_max, 0.0f), 1.0f);
+    float rt = (float)fmin(fmax(r_count / r_max, 0.0), 1.0);
+    float gt = (float)fmin(fmax(g_count / g_max, 0.0), 1.0);
+    float bt = (float)fmin(fmax(b_count / b_max, 0.0), 1.0);
 
     float r = 1.0f - powf(1.0f - rt, P.gamma);
     float g = 1.0f - powf(1.0f - gt, P.gamma);
@@ -365,11 +576,59 @@ static void print_usage(const char* argv0) {
         "  --checkpoint-every N     merge+tonemap+save every N rounds (default 0=off)\n"
         "                           (each checkpoint writes <output>.cpNNNN.png;\n"
         "                            safe to interrupt — latest cp is usable)\n"
+        "  --build-imap PATH        build importance map (Phase 1 of Bitterli IS),\n"
+        "                           save to PATH, exit. Skips render entirely.\n"
+        "  --imap-resolution N      IMap grid resolution (default 1024)\n"
+        "  --imap-samples N         total uniform samples for IMap construction\n"
+        "                           (default 100000000)\n"
+        "  --imap-iter-cap N        iteration cap for orbit-length weighting in\n"
+        "                           the IMap pass (default 2000)\n"
+        "  --imap-heatmap PATH      also write 16-bit grayscale PNG heatmap of\n"
+        "                           the IMap for visual inspection.\n"
+        "  --imap PATH              load importance map; switch to Bitterli IS\n"
+        "                           sampling with inverse-probability weighting.\n"
+        "                           Without this, sampling is uniform on disk.\n"
+        "  --min-iter-r N           min escape iterations to contribute to R\n"
+        "                           channel (default 0 = all escapes counted).\n"
+        "                           Aramant filtering: 100-200 for sharper R.\n"
+        "  --min-iter-g N           min escape iter for G channel (default 0).\n"
+        "  --min-iter-b N           min escape iter for B channel (default 0).\n"
+        "  --output-raw PATH        write raw uint64 histogram to PATH (.bin) at\n"
+        "                           every save. Default: derived from --output\n"
+        "                           (e.g., output.png -> output.bin). 128-byte\n"
+        "                           HistHeader + uint64[hist_count] data. Enables\n"
+        "                           --resume-from + EXR generation + cheap trim\n"
+        "                           retune via tools/retune_trims.py.\n"
+        "                           File is ~4.83 GB at 16K, ~19.3 GB at 32K.\n"
+        "                           Atomic write: tmp + rename.\n"
+        "  --no-output-raw          suppress the .bin dump entirely (disk-\n"
+        "                           constrained scenarios; loses cheap-retune\n"
+        "                           ability — see CLAUDE.md B14/B15).\n"
+        "  --resume-from PATH       load <PATH>.bin into the histogram before\n"
+        "                           rendering; continues accumulation. Validates\n"
+        "                           header (magic, dims, iter caps, hist_scale).\n"
+        "                           samples_done from header is subtracted from\n"
+        "                           --samples target so render does only the delta.\n"
+        "                           Requires a matching .bin from a prior --output-raw run.\n"
+        "  --allow-view-mismatch    skip the view-parameter sanity check on\n"
+        "                           --resume-from (use with care).\n"
         "  --help                   show this message\n",
         argv0);
 }
 
 int main(int argc, char** argv) {
+    // Install SIGUSR1 graceful-terminate handler (Linux/cloud only). Watchdog
+    // fires SIGUSR1 at T-300s before hard wallclock cap; render loop checks
+    // g_terminate_requested at every round boundary, runs final save, exits 0.
+#if defined(__unix__) || defined(__APPLE__)
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = buddhabrot_sigusr1_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;  // restart interrupted syscalls
+    sigaction(SIGUSR1, &sa, nullptr);
+#endif
+
     // Defaults
     int   width                 = 16384;
     int   height                = 12288;
@@ -406,6 +665,32 @@ int main(int argc, char** argv) {
 
     int checkpoint_every_rounds = 0;       // 0 = no checkpoints
 
+    // Phase 1 (Bitterli importance map) build mode flags. Empty path = render mode.
+    std::string build_imap_path;
+    unsigned int imap_resolution = 1024;
+    unsigned long long imap_samples = 100000000ULL;
+    unsigned int imap_iter_cap = 2000;
+    std::string imap_heatmap_path;
+
+    // Phase 2/3/4 (Bitterli IS sampling + min-escape) flags.
+    std::string imap_path;                  // empty = uniform sampling
+    unsigned int min_iter_r_main = 0;
+    unsigned int min_iter_g_main = 0;
+    unsigned int min_iter_b_main = 0;
+
+    // §B7 RAW histogram dump + resume-from flags.
+    // output_raw_path: empty = auto-derive from --output (write <output>.bin) by default.
+    //   Override with explicit --output-raw <path> for custom location.
+    //   Suppress entirely with --no-output-raw (disk-constrained users only).
+    // The auto-on default is per CLAUDE.md B15 (persistence audit): the histogram is
+    // the expensive artifact, the .bin is free architectural insurance — always write
+    // it unless explicitly suppressed.
+    std::string output_raw_path;
+    int output_raw_explicit = 0;            // 1 if --output-raw <path> was given
+    int output_raw_disabled = 0;            // 1 if --no-output-raw was given
+    std::string resume_from_path;           // empty = fresh render
+    int allow_view_mismatch = 0;            // override view-param validation on resume
+
     // CLI
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -440,8 +725,37 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--devices"))            requested_devices = atoi(need(a));
         else if (!strcmp(a, "--launches-per-round")) launches_per_round = atoi(need(a));
         else if (!strcmp(a, "--checkpoint-every"))   checkpoint_every_rounds = atoi(need(a));
+        else if (!strcmp(a, "--build-imap"))         build_imap_path = need(a);
+        else if (!strcmp(a, "--imap-resolution"))    imap_resolution = (unsigned)atoi(need(a));
+        else if (!strcmp(a, "--imap-samples"))       imap_samples = strtoull(need(a), nullptr, 10);
+        else if (!strcmp(a, "--imap-iter-cap"))      imap_iter_cap = (unsigned)atoi(need(a));
+        else if (!strcmp(a, "--imap-heatmap"))       imap_heatmap_path = need(a);
+        else if (!strcmp(a, "--imap"))               imap_path = need(a);
+        else if (!strcmp(a, "--min-iter-r"))         min_iter_r_main = (unsigned)atoi(need(a));
+        else if (!strcmp(a, "--min-iter-g"))         min_iter_g_main = (unsigned)atoi(need(a));
+        else if (!strcmp(a, "--min-iter-b"))         min_iter_b_main = (unsigned)atoi(need(a));
+        else if (!strcmp(a, "--output-raw"))         { output_raw_path = need(a); output_raw_explicit = 1; }
+        else if (!strcmp(a, "--no-output-raw"))      output_raw_disabled = 1;
+        else if (!strcmp(a, "--resume-from"))        resume_from_path = need(a);
+        else if (!strcmp(a, "--allow-view-mismatch")) allow_view_mismatch = 1;
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { print_usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown arg: %s\n", a); print_usage(argv[0]); return 1; }
+    }
+
+    // §B7 unconditional .bin dump: derive path from --output unless explicitly set or disabled.
+    // Per CLAUDE.md B15 (persistence audit): the histogram is the expensive artifact;
+    // .bin is free architectural insurance — always written by default. Suppress only with
+    // explicit --no-output-raw (disk-constrained users).
+    if (!output_raw_disabled && !output_raw_explicit) {
+        std::string base = output_path;
+        auto dot = base.rfind('.');
+        if (dot != std::string::npos && dot > 0) {
+            output_raw_path = base.substr(0, dot) + ".bin";
+        } else {
+            output_raw_path = base + ".bin";
+        }
+    } else if (output_raw_disabled) {
+        output_raw_path.clear();
     }
 
     Params P{};
@@ -473,10 +787,177 @@ int main(int argc, char** argv) {
     P.trim_b                      = (float)trim_b;
     P.samples_per_thread          = samples_per_thread;
 
+    // -----------------------------------------------------------------------
+    // Phase 1 — IMap build mode. If --build-imap is set, build the importance
+    // map and exit; the render path below is skipped entirely. Output is a
+    // self-describing imap.bin (40-byte header + N*N uint32 cells) plus an
+    // optional 16-bit grayscale heatmap PNG for visual inspection.
+    // -----------------------------------------------------------------------
+    if (!build_imap_path.empty()) {
+        fprintf(stderr, "===========================================\n");
+        fprintf(stderr, "Buddhabrot CUDA — Phase 1 (IMap build pass)\n");
+        fprintf(stderr, "Output IMap     : %s  (%ux%u cells)\n",
+            build_imap_path.c_str(), imap_resolution, imap_resolution);
+        fprintf(stderr, "Sample budget   : %llu uniform-on-disk samples\n",
+            (unsigned long long)imap_samples);
+        fprintf(stderr, "IMap iter cap   : %u\n", imap_iter_cap);
+        fprintf(stderr, "Sample disk     : center=(%.4f,%.4f) radius=%.4f\n",
+            P.sample_center_x, P.sample_center_y, P.sample_radius);
+        if (!imap_heatmap_path.empty()) {
+            fprintf(stderr, "Heatmap PNG     : %s\n", imap_heatmap_path.c_str());
+        }
+        fprintf(stderr, "Base seed (u64) : %llu\n", (unsigned long long)base_seed);
+        fprintf(stderr, "===========================================\n");
+
+        int total_devices_imap = 0;
+        check(cudaGetDeviceCount(&total_devices_imap), "GetDeviceCount");
+        if (total_devices_imap < 1) {
+            fprintf(stderr, "No CUDA devices found.\n");
+            return 1;
+        }
+        check(cudaSetDevice(0), "set dev 0 imap");
+        cudaDeviceProp prop_imap{};
+        check(cudaGetDeviceProperties(&prop_imap, 0), "device props imap");
+        fprintf(stderr, "Device          : [0] %s  sm_%d%d  %.1f GB\n",
+            prop_imap.name, prop_imap.major, prop_imap.minor,
+            (double)prop_imap.totalGlobalMem / (double)(1ULL << 30));
+
+        size_t imap_cells = (size_t)imap_resolution * (size_t)imap_resolution;
+        size_t imap_bytes = imap_cells * sizeof(unsigned int);
+        unsigned int* d_imap = nullptr;
+        check(cudaMalloc(&d_imap, imap_bytes), "cudaMalloc imap");
+        check(cudaMemset(d_imap, 0, imap_bytes), "cudaMemset imap");
+
+        unsigned long long samples_per_launch =
+            (unsigned long long)blocks_per_launch * threads_per_block * samples_per_thread;
+        unsigned long long n_launches =
+            (imap_samples + samples_per_launch - 1) / samples_per_launch;
+        fprintf(stderr, "Launch grid     : %d blocks x %d threads x %u samples/thr\n",
+            blocks_per_launch, threads_per_block, samples_per_thread);
+        fprintf(stderr, "Launches        : %llu (covers ~%llu samples)\n",
+            (unsigned long long)n_launches,
+            (unsigned long long)(n_launches * samples_per_launch));
+
+        cudaStream_t stream_imap;
+        check(cudaStreamCreate(&stream_imap), "stream create imap");
+
+        double t_start_imap = now_seconds();
+        for (unsigned long long L = 0; L < n_launches; L++) {
+            Params local_P = P;
+            // Distinct seed domain from render to avoid correlation if both run.
+            local_P.seed_64 = base_seed
+                            ^ (L * 0x9E3779B97F4A7C15ULL)
+                            ^ 0x12345678ABCDEF01ULL;
+            imap_pass_kernel<<<blocks_per_launch, threads_per_block, 0, stream_imap>>>(
+                d_imap, local_P, imap_resolution, imap_iter_cap);
+        }
+        check(cudaStreamSynchronize(stream_imap), "stream sync imap");
+        double t_compute_imap = now_seconds() - t_start_imap;
+
+        std::vector<unsigned int> h_imap(imap_cells, 0u);
+        check(cudaMemcpy(h_imap.data(), d_imap, imap_bytes, cudaMemcpyDeviceToHost),
+              "memcpy imap");
+
+        unsigned long long total_mass = 0ULL;
+        unsigned int max_cell = 0u;
+        unsigned int nonzero_cells = 0u;
+        for (size_t i = 0; i < imap_cells; i++) {
+            unsigned int v = h_imap[i];
+            total_mass += (unsigned long long)v;
+            if (v > max_cell) max_cell = v;
+            if (v > 0u) nonzero_cells++;
+        }
+        fprintf(stderr, "===========================================\n");
+        fprintf(stderr, "Compute time    : %.3f s  (%.1f M samples / s)\n",
+            t_compute_imap,
+            (double)(n_launches * samples_per_launch) / t_compute_imap / 1e6);
+        fprintf(stderr, "Total mass      : %llu (sum of orbit lengths over escaped c)\n",
+            (unsigned long long)total_mass);
+        fprintf(stderr, "Nonzero cells   : %u / %zu  (%.2f%%)\n",
+            nonzero_cells, imap_cells,
+            100.0 * (double)nonzero_cells / (double)imap_cells);
+        fprintf(stderr, "Max cell        : %u\n", max_cell);
+        if (max_cell > 0u) {
+            fprintf(stderr, "Mean nonzero    : %.1f (mass/nonzero_cells)\n",
+                (double)total_mass / (double)nonzero_cells);
+        }
+        fprintf(stderr, "===========================================\n");
+
+        // Write imap.bin: 40-byte header + raw uint32 data.
+        {
+            FILE* f = fopen(build_imap_path.c_str(), "wb");
+            if (!f) {
+                fprintf(stderr, "Failed to open %s for writing\n", build_imap_path.c_str());
+                cudaFree(d_imap);
+                cudaStreamDestroy(stream_imap);
+                return 1;
+            }
+            const char magic[4] = {'I','M','A','P'};
+            unsigned int version = 1u;
+            unsigned int reserved = 0u;
+            float disk_cx = P.sample_center_x;
+            float disk_cy = P.sample_center_y;
+            float disk_r  = P.sample_radius;
+            float reserved2 = 0.0f;
+            fwrite(magic, 1, 4, f);
+            fwrite(&version, sizeof(unsigned int), 1, f);
+            fwrite(&imap_resolution, sizeof(unsigned int), 1, f);
+            fwrite(&imap_resolution, sizeof(unsigned int), 1, f); // square
+            fwrite(&reserved, sizeof(unsigned int), 1, f);
+            fwrite(&total_mass, sizeof(unsigned long long), 1, f);
+            fwrite(&disk_cx, sizeof(float), 1, f);
+            fwrite(&disk_cy, sizeof(float), 1, f);
+            fwrite(&disk_r,  sizeof(float), 1, f);
+            fwrite(&reserved2, sizeof(float), 1, f);
+            fwrite(h_imap.data(), sizeof(unsigned int), imap_cells, f);
+            fclose(f);
+            fprintf(stderr, "Wrote IMap: %s (%.1f KB)\n",
+                build_imap_path.c_str(),
+                (double)(40 + imap_bytes) / 1024.0);
+        }
+
+        // Optional heatmap PNG. Use sqrt compression so mid-density cells are
+        // visible (linear would only show the brightest boundary cells; log
+        // would crush the dynamic range). 16-bit grayscale PNG via lodepng.
+        if (!imap_heatmap_path.empty()) {
+            std::vector<unsigned char> heatmap(imap_cells * 2);
+            float inv_max = (max_cell > 0u) ? 1.0f / (float)max_cell : 0.0f;
+            for (size_t i = 0; i < imap_cells; i++) {
+                float t = sqrtf((float)h_imap[i] * inv_max);
+                if (t < 0.0f) t = 0.0f;
+                if (t > 1.0f) t = 1.0f;
+                uint16_t v16 = (uint16_t)(t * 65535.0f);
+                heatmap[i * 2 + 0] = (unsigned char)(v16 >> 8);   // big-endian
+                heatmap[i * 2 + 1] = (unsigned char)(v16 & 0xFF);
+            }
+            lodepng::State state;
+            state.info_raw.bitdepth = 16;
+            state.info_raw.colortype = LCT_GREY;
+            state.info_png.color.bitdepth = 16;
+            state.info_png.color.colortype = LCT_GREY;
+            state.encoder.auto_convert = 0;
+            std::vector<unsigned char> png;
+            unsigned err = lodepng::encode(png, heatmap, imap_resolution, imap_resolution, state);
+            if (!err) err = lodepng::save_file(png, imap_heatmap_path);
+            if (err) {
+                fprintf(stderr, "Heatmap encode/save error %u: %s\n",
+                    err, lodepng_error_text(err));
+            } else {
+                fprintf(stderr, "Wrote heatmap: %s (%.1f KB)\n",
+                    imap_heatmap_path.c_str(),
+                    (double)png.size() / 1024.0);
+            }
+        }
+
+        cudaFree(d_imap);
+        cudaStreamDestroy(stream_imap);
+        return 0;
+    }
+
     // Memory budget
     size_t pixels     = (size_t)width * (size_t)height;
     size_t hist_count = pixels * 3 + 3;
-    size_t hist_bytes = hist_count * sizeof(unsigned int);
+    size_t hist_bytes = hist_count * sizeof(unsigned long long);
     size_t out_count  = pixels * 3;
     size_t out_bytes  = out_count * sizeof(uint16_t);
 
@@ -531,8 +1012,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Allocate per-device histograms
-    std::vector<unsigned int*> d_hist(n_devices, nullptr);
+    // Allocate per-device histograms (uint64 for IS-weight headroom)
+    std::vector<unsigned long long*> d_hist(n_devices, nullptr);
     for (int d = 0; d < n_devices; d++) {
         check(cudaSetDevice(d), "set device alloc");
         check(cudaMalloc(&d_hist[d], hist_bytes), "cudaMalloc hist");
@@ -575,11 +1056,241 @@ int main(int argc, char** argv) {
     fprintf(stderr, "===========================================\n");
 
     // Allocate the merge staging buffer once (kept for reuse at every checkpoint).
-    unsigned int* d_staging = nullptr;
+    unsigned long long* d_staging = nullptr;
     if (n_devices > 1) {
         check(cudaSetDevice(0), "set dev 0 staging");
         check(cudaMalloc(&d_staging, hist_bytes), "cudaMalloc staging");
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 2/3 — IMap loading + Vose alias method tables.
+    // When --imap is set, switch from uniform-on-disk to Bitterli IS sampling
+    // with inverse-probability weighting. The kernel takes nullptr alias_table
+    // when IS is disabled, falling back to the uniform path.
+    // -----------------------------------------------------------------------
+    unsigned int*       d_alias_table     = nullptr;
+    float*              d_alias_threshold = nullptr;
+    unsigned int*       d_imap_data       = nullptr;
+    unsigned long long  imap_total_mass   = 0ULL;
+    unsigned int        imap_res_loaded   = 0u;
+
+    if (!imap_path.empty()) {
+        FILE* f = fopen(imap_path.c_str(), "rb");
+        if (!f) {
+            fprintf(stderr, "Failed to open IMap %s\n", imap_path.c_str());
+            return 1;
+        }
+        char magic[4];
+        unsigned int version = 0u;
+        unsigned int imap_w = 0u, imap_h = 0u;
+        unsigned int reserved = 0u;
+        unsigned long long total_mass_loaded = 0ULL;
+        float disk_cx = 0.0f, disk_cy = 0.0f, disk_r_loaded = 0.0f;
+        float reserved2 = 0.0f;
+        size_t nr = 0;
+        nr += fread(magic, 1, 4, f);
+        nr += fread(&version, sizeof(unsigned int), 1, f) * sizeof(unsigned int);
+        nr += fread(&imap_w, sizeof(unsigned int), 1, f) * sizeof(unsigned int);
+        nr += fread(&imap_h, sizeof(unsigned int), 1, f) * sizeof(unsigned int);
+        nr += fread(&reserved, sizeof(unsigned int), 1, f) * sizeof(unsigned int);
+        nr += fread(&total_mass_loaded, sizeof(unsigned long long), 1, f) * sizeof(unsigned long long);
+        nr += fread(&disk_cx, sizeof(float), 1, f) * sizeof(float);
+        nr += fread(&disk_cy, sizeof(float), 1, f) * sizeof(float);
+        nr += fread(&disk_r_loaded, sizeof(float), 1, f) * sizeof(float);
+        nr += fread(&reserved2, sizeof(float), 1, f) * sizeof(float);
+        if (memcmp(magic, "IMAP", 4) != 0 || version != 1u || imap_w == 0u || imap_w != imap_h) {
+            fprintf(stderr, "Invalid IMap header in %s\n", imap_path.c_str());
+            fclose(f);
+            return 1;
+        }
+        if (fabsf(disk_cx - P.sample_center_x) > 1e-3f ||
+            fabsf(disk_cy - P.sample_center_y) > 1e-3f ||
+            fabsf(disk_r_loaded - P.sample_radius) > 1e-3f) {
+            fprintf(stderr, "WARNING: IMap disk (%.4f,%.4f r=%.4f) != render disk (%.4f,%.4f r=%.4f)\n",
+                disk_cx, disk_cy, disk_r_loaded,
+                P.sample_center_x, P.sample_center_y, P.sample_radius);
+        }
+        size_t n_cells = (size_t)imap_w * (size_t)imap_h;
+        std::vector<unsigned int> imap_host(n_cells);
+        size_t got = fread(imap_host.data(), sizeof(unsigned int), n_cells, f);
+        fclose(f);
+        if (got != n_cells) {
+            fprintf(stderr, "IMap data short read: %zu / %zu cells\n", got, n_cells);
+            return 1;
+        }
+        imap_res_loaded = imap_w;
+        imap_total_mass = total_mass_loaded;
+
+        // Build Vose alias method tables on host. Standard algorithm: scale
+        // probabilities by n_cells so average = 1; partition into < 1 (small)
+        // and >= 1 (large); for each pair, the small cell's threshold is its
+        // scaled prob and its alias is the large cell; the large cell's mass
+        // is reduced by what it gave away. Iterate until exhausted.
+        std::vector<float> threshold(n_cells);
+        std::vector<unsigned int> alias(n_cells);
+        std::vector<float> p_scaled(n_cells);
+        double inv_total = 1.0 / (double)total_mass_loaded;
+        for (size_t i = 0; i < n_cells; i++) {
+            p_scaled[i] = (float)((double)imap_host[i] * inv_total * (double)n_cells);
+        }
+        std::vector<unsigned int> small_q;
+        std::vector<unsigned int> large_q;
+        small_q.reserve(n_cells / 2);
+        large_q.reserve(n_cells / 2);
+        for (size_t i = 0; i < n_cells; i++) {
+            if (p_scaled[i] < 1.0f) small_q.push_back((unsigned int)i);
+            else                    large_q.push_back((unsigned int)i);
+        }
+        while (!small_q.empty() && !large_q.empty()) {
+            unsigned int s = small_q.back(); small_q.pop_back();
+            unsigned int l = large_q.back(); large_q.pop_back();
+            threshold[s] = p_scaled[s];
+            alias[s] = l;
+            p_scaled[l] = (p_scaled[l] + p_scaled[s]) - 1.0f;
+            if (p_scaled[l] < 1.0f) small_q.push_back(l);
+            else                    large_q.push_back(l);
+        }
+        while (!large_q.empty()) {
+            unsigned int l = large_q.back(); large_q.pop_back();
+            threshold[l] = 1.0f;
+            alias[l] = l;
+        }
+        while (!small_q.empty()) {
+            unsigned int s = small_q.back(); small_q.pop_back();
+            threshold[s] = 1.0f;
+            alias[s] = s;
+        }
+
+        check(cudaSetDevice(0), "set dev 0 imap upload");
+        check(cudaMalloc(&d_alias_table,     n_cells * sizeof(unsigned int)), "alias_table malloc");
+        check(cudaMalloc(&d_alias_threshold, n_cells * sizeof(float)),        "alias_threshold malloc");
+        check(cudaMalloc(&d_imap_data,       n_cells * sizeof(unsigned int)), "imap_data malloc");
+        check(cudaMemcpy(d_alias_table,     alias.data(),     n_cells * sizeof(unsigned int), cudaMemcpyHostToDevice), "memcpy alias");
+        check(cudaMemcpy(d_alias_threshold, threshold.data(), n_cells * sizeof(float),        cudaMemcpyHostToDevice), "memcpy threshold");
+        check(cudaMemcpy(d_imap_data,       imap_host.data(), n_cells * sizeof(unsigned int), cudaMemcpyHostToDevice), "memcpy imap");
+
+        fprintf(stderr, "IMap loaded     : %s  (%ux%u, total_mass=%llu)\n",
+            imap_path.c_str(), imap_res_loaded, imap_res_loaded,
+            (unsigned long long)imap_total_mass);
+        fprintf(stderr, "Mode            : Bitterli IS + inverse-probability weighting\n");
+        if (min_iter_r_main > 0u || min_iter_g_main > 0u || min_iter_b_main > 0u) {
+            fprintf(stderr, "Min escape iter : R>=%u  G>=%u  B>=%u (Aramant filtering)\n",
+                min_iter_r_main, min_iter_g_main, min_iter_b_main);
+        }
+        fprintf(stderr, "===========================================\n");
+    } else {
+        fprintf(stderr, "Mode            : uniform on disk (no --imap given)\n");
+        fprintf(stderr, "===========================================\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // §B7 — Resume-from-raw-histogram. If --resume-from PATH is set, load the
+    // .bin file's histogram into d_hist[0], validate header against current
+    // invocation, and set samples_done_at_start so the render loop only does
+    // the delta to reach total_samples target.
+    // Failsafe: any validation error aborts with E220 (use --allow-view-mismatch
+    // to override the soft view-param check). Atomic write of the .bin guarantees
+    // a half-written tmp file from a crashed prior run won't be picked up.
+    // -----------------------------------------------------------------------
+    unsigned long long samples_done_at_start = 0ULL;
+    if (!resume_from_path.empty()) {
+        FILE* rf = fopen(resume_from_path.c_str(), "rb");
+        if (!rf) {
+            fprintf(stderr, "[ERROR E220] Failed to open resume file %s\n", resume_from_path.c_str());
+            return 1;
+        }
+        HistHeader hdr{};
+        size_t hdr_read = fread(&hdr, 1, sizeof(HistHeader), rf);
+        if (hdr_read != sizeof(HistHeader)) {
+            fprintf(stderr, "[ERROR E220] Short header read from %s (%zu bytes; expected %zu)\n",
+                resume_from_path.c_str(), hdr_read, sizeof(HistHeader));
+            fclose(rf); return 1;
+        }
+        if (memcmp(hdr.magic, "BHRA", 4) != 0) {
+            fprintf(stderr, "[ERROR E220] Invalid magic in %s (expected BHRA)\n", resume_from_path.c_str());
+            fclose(rf); return 1;
+        }
+        if (hdr.version != 1u) {
+            fprintf(stderr, "[ERROR E220] Unsupported version %u in %s\n",
+                hdr.version, resume_from_path.c_str());
+            fclose(rf); return 1;
+        }
+        if (hdr.width != (unsigned)width || hdr.height != (unsigned)height) {
+            fprintf(stderr, "[ERROR E220] Resume dim mismatch: file=%ux%u, current=%dx%d\n",
+                hdr.width, hdr.height, width, height);
+            fclose(rf); return 1;
+        }
+        if (hdr.iter_r != max_iter_r || hdr.iter_g != max_iter_g || hdr.iter_b != max_iter_b) {
+            fprintf(stderr, "[ERROR E220] Resume iter cap mismatch: file=%u/%u/%u, current=%u/%u/%u\n",
+                hdr.iter_r, hdr.iter_g, hdr.iter_b, max_iter_r, max_iter_g, max_iter_b);
+            fclose(rf); return 1;
+        }
+        if (hdr.hist_scale != (unsigned)HIST_SCALE) {
+            fprintf(stderr, "[ERROR E220] Resume HIST_SCALE mismatch: file=%u, current=%llu\n",
+                hdr.hist_scale, (unsigned long long)HIST_SCALE);
+            fclose(rf); return 1;
+        }
+        unsigned int cur_imap_used = imap_path.empty() ? 0u : 1u;
+        if (hdr.imap_used != cur_imap_used) {
+            fprintf(stderr, "[ERROR E220] Resume IS-mode mismatch: file imap_used=%u, current=%u\n",
+                hdr.imap_used, cur_imap_used);
+            fclose(rf); return 1;
+        }
+        if (hdr.hist_count != (unsigned long long)hist_count) {
+            fprintf(stderr, "[ERROR E220] Resume hist_count mismatch: file=%llu, current=%zu\n",
+                (unsigned long long)hdr.hist_count, hist_count);
+            fclose(rf); return 1;
+        }
+        if (!allow_view_mismatch) {
+            const double eps = 1e-6;
+            if (fabs(hdr.view_center_x - view_center_x) > eps ||
+                fabs(hdr.view_center_y - view_center_y) > eps ||
+                fabs(hdr.zoom - zoom) > eps ||
+                fabs(hdr.rotation_deg - rotation_deg) > eps ||
+                fabs(hdr.sample_center_x - sample_center_x) > eps ||
+                fabs(hdr.sample_center_y - sample_center_y) > eps ||
+                fabs(hdr.sample_radius - sample_radius) > eps) {
+                fprintf(stderr, "[ERROR E220] Resume view-param mismatch (override with --allow-view-mismatch)\n");
+                fprintf(stderr, "  file: cx=%.10f cy=%.10f zoom=%.4f rot=%.2f sc=(%.4f,%.4f) sr=%.4f\n",
+                    hdr.view_center_x, hdr.view_center_y, hdr.zoom, hdr.rotation_deg,
+                    hdr.sample_center_x, hdr.sample_center_y, hdr.sample_radius);
+                fprintf(stderr, "  curr: cx=%.10f cy=%.10f zoom=%.4f rot=%.2f sc=(%.4f,%.4f) sr=%.4f\n",
+                    view_center_x, view_center_y, zoom, rotation_deg,
+                    sample_center_x, sample_center_y, sample_radius);
+                fclose(rf); return 1;
+            }
+        }
+        // Read histogram body
+        std::vector<unsigned long long> host_hist(hist_count);
+        size_t hist_read = fread(host_hist.data(), sizeof(unsigned long long), hist_count, rf);
+        fclose(rf);
+        if (hist_read != hist_count) {
+            fprintf(stderr, "[ERROR E220] Short histogram read from %s (%zu of %zu cells)\n",
+                resume_from_path.c_str(), hist_read, hist_count);
+            return 1;
+        }
+        // Copy to device 0 (other devices stay at zero; they'll add fresh samples and merge in).
+        check(cudaSetDevice(0), "set dev 0 resume");
+        check(cudaMemcpy(d_hist[0], host_hist.data(), hist_bytes, cudaMemcpyHostToDevice),
+            "memcpy resume hist");
+        samples_done_at_start = hdr.samples_done;
+        fprintf(stderr, "===========================================\n");
+        fprintf(stderr, "Resumed from   : %s\n", resume_from_path.c_str());
+        fprintf(stderr, "Loaded samples : %llu (target %llu, delta to render %llu)\n",
+            (unsigned long long)samples_done_at_start,
+            (unsigned long long)total_samples,
+            (unsigned long long)(total_samples > samples_done_at_start
+                ? total_samples - samples_done_at_start : 0));
+        if (samples_done_at_start >= total_samples) {
+            fprintf(stderr, "Already at >= target samples; will re-save final + bin and exit.\n");
+        }
+        fprintf(stderr, "===========================================\n");
+    }
+
+    // Track cumulative samples for progress reporting + the raw header's
+    // samples_done field. Initialized to samples_done_at_start; the render
+    // loop adds this-run progress on top.
+    unsigned long long samples_done_total = samples_done_at_start;
 
     // -----------------------------------------------------------------------
     // save_image: merge per-device histograms onto device 0 (destructive — zeroes
@@ -607,26 +1318,26 @@ int main(int argc, char** argv) {
                 check(cudaSetDevice(0), "back to dev 0");
             }
             // Recompute master max slots from the merged pixel data.
-            check(cudaMemset(d_hist[0] + pixels * 3, 0, 3 * sizeof(unsigned int)),
+            check(cudaMemset(d_hist[0] + pixels * 3, 0, 3 * sizeof(unsigned long long)),
                   "zero master max slots");
             compute_max_kernel<<<blocks_sum, 256>>>(d_hist[0], (unsigned int)pixels);
             check(cudaDeviceSynchronize(), "merge max sync");
         }
 
         // Read channel maxima for diagnostics + optional auto-trim derivation.
-        std::vector<unsigned int> tail(3);
-        check(cudaMemcpy(tail.data(), d_hist[0] + pixels * 3, 3 * sizeof(unsigned int),
+        // Note: hist values are scaled by HIST_SCALE; reported maxes here are raw
+        // (scaled). Trim ratios are invariant.
+        std::vector<unsigned long long> tail(3);
+        check(cudaMemcpy(tail.data(), d_hist[0] + pixels * 3, 3 * sizeof(unsigned long long),
                          cudaMemcpyDeviceToHost), "memcpy tail");
-        fprintf(stderr, "  channel maxes  R=%u  G=%u  B=%u\n", tail[0], tail[1], tail[2]);
-        if (tail[0] > 0xC0000000u || tail[1] > 0xC0000000u || tail[2] > 0xC0000000u) {
-            fprintf(stderr, "  WARNING: channel max >75%% of UINT32_MAX — reduce samples or upgrade hist to u64.\n");
-        }
+        fprintf(stderr, "  channel maxes  R=%llu  G=%llu  B=%llu\n",
+            (unsigned long long)tail[0], (unsigned long long)tail[1], (unsigned long long)tail[2]);
 
         Params local_P = P;
         if (target_r > 0.0 || target_g > 0.0 || target_b > 0.0) {
-            if (target_r > 0.0 && tail[0] > 0u) local_P.trim_r = (float)(target_r / (double)tail[0]);
-            if (target_g > 0.0 && tail[1] > 0u) local_P.trim_g = (float)(target_g / (double)tail[1]);
-            if (target_b > 0.0 && tail[2] > 0u) local_P.trim_b = (float)(target_b / (double)tail[2]);
+            if (target_r > 0.0 && tail[0] > 0ULL) local_P.trim_r = (float)(target_r / (double)tail[0]);
+            if (target_g > 0.0 && tail[1] > 0ULL) local_P.trim_g = (float)(target_g / (double)tail[1]);
+            if (target_b > 0.0 && tail[2] > 0ULL) local_P.trim_b = (float)(target_b / (double)tail[2]);
             fprintf(stderr, "  auto-trim      r=%.4f  g=%.4f  b=%.4f\n",
                 local_P.trim_r, local_P.trim_g, local_P.trim_b);
         }
@@ -663,6 +1374,76 @@ int main(int argc, char** argv) {
             return false;
         }
         fprintf(stderr, "  -> %s  (%.1f MB)\n", path.c_str(), (double)png.size() / (1024.0*1024.0));
+
+        // §B7: write raw uint64 histogram alongside the PNG if --output-raw is set.
+        // Atomic write via tmp + rename. Failure logs E400 but does NOT abort the
+        // render — VRAM histogram is the source of truth, .bin is the snapshot.
+        if (!output_raw_path.empty()) {
+            std::string raw_path;
+            auto dot = path.rfind('.');
+            if (dot != std::string::npos && dot > 0) {
+                raw_path = path.substr(0, dot) + ".bin";
+            } else {
+                raw_path = path + ".bin";
+            }
+            HistHeader hdr{};
+            memcpy(hdr.magic, "BHRA", 4);
+            hdr.version = 1u;
+            hdr.width = (unsigned)width;
+            hdr.height = (unsigned)height;
+            hdr.reserved0 = 0u;
+            hdr.hist_count = (unsigned long long)hist_count;
+            hdr.samples_done = samples_done_total;
+            hdr.base_seed_used = base_seed;
+            hdr.view_center_x = view_center_x;
+            hdr.view_center_y = view_center_y;
+            hdr.zoom = zoom;
+            hdr.rotation_deg = rotation_deg;
+            hdr.sample_center_x = sample_center_x;
+            hdr.sample_center_y = sample_center_y;
+            hdr.sample_radius = sample_radius;
+            hdr.iter_r = max_iter_r;
+            hdr.iter_g = max_iter_g;
+            hdr.iter_b = max_iter_b;
+            hdr.hist_scale = (unsigned)HIST_SCALE;
+            hdr.imap_used = imap_path.empty() ? 0u : 1u;
+            memset(hdr.imap_marker, 0, 4);
+            hdr.reserved_pad0 = 0u;
+
+            std::vector<unsigned long long> host_hist(hist_count);
+            check(cudaMemcpy(host_hist.data(), d_hist[0], hist_bytes, cudaMemcpyDeviceToHost),
+                "memcpy raw hist out");
+
+            std::string tmp_path = raw_path + ".tmp";
+            FILE* rf = fopen(tmp_path.c_str(), "wb");
+            if (!rf) {
+                fprintf(stderr, "  [WARN E400] failed to open %s for raw write; skipping (render continues)\n",
+                    tmp_path.c_str());
+            } else {
+                bool raw_ok = (fwrite(&hdr, 1, sizeof(HistHeader), rf) == sizeof(HistHeader));
+                if (raw_ok) {
+                    raw_ok = (fwrite(host_hist.data(), sizeof(unsigned long long), hist_count, rf) == hist_count);
+                }
+                fclose(rf);
+                if (raw_ok) {
+                    remove(raw_path.c_str()); // Windows requires removal before rename
+                    if (rename(tmp_path.c_str(), raw_path.c_str()) == 0) {
+                        fprintf(stderr, "  -> %s  (%.2f GB raw, samples_done=%llu)\n",
+                            raw_path.c_str(),
+                            (double)(sizeof(HistHeader) + hist_bytes) / (1024.0*1024.0*1024.0),
+                            (unsigned long long)samples_done_total);
+                    } else {
+                        fprintf(stderr, "  [WARN E400] rename(%s -> %s) failed; tmp remains, render continues\n",
+                            tmp_path.c_str(), raw_path.c_str());
+                    }
+                } else {
+                    fprintf(stderr, "  [WARN E400] raw fwrite failed; cleaning %s, render continues\n",
+                        tmp_path.c_str());
+                    remove(tmp_path.c_str());
+                }
+            }
+        }
+
         return true;
     };
 
@@ -691,6 +1472,15 @@ int main(int argc, char** argv) {
         (launches_per_device + (unsigned long long)launches_per_round - 1)
         / (unsigned long long)launches_per_round;
 
+    // §B7: skip render loop entirely if resume already has target samples.
+    // The final save below still runs, producing a fresh PNG/.bin from the
+    // loaded histogram (useful if the user wants to re-tonemap with new trims).
+    if (samples_done_total >= total_samples && total_samples > 0ULL) {
+        fprintf(stderr, "Resume state already at target samples (%llu >= %llu); skipping render loop.\n",
+            (unsigned long long)samples_done_total, (unsigned long long)total_samples);
+        n_rounds = 0;
+    }
+
     for (unsigned long long round = 0; round < n_rounds; round++) {
         unsigned long long round_start = round * (unsigned long long)launches_per_round;
         unsigned long long round_end   = std::min(
@@ -705,7 +1495,10 @@ int main(int argc, char** argv) {
                                 ^ ((unsigned long long)d * 0xC2B2AE3D27D4EB4FULL)
                                 ^ (L                   * 0x9E3779B97F4A7C15ULL);
                 buddhabrot_kernel<<<blocks_per_launch, threads_per_block, 0, streams[d]>>>(
-                    d_hist[d], local_P);
+                    d_hist[d], local_P,
+                    d_alias_table, d_alias_threshold, d_imap_data,
+                    imap_total_mass, imap_res_loaded,
+                    min_iter_r_main, min_iter_g_main, min_iter_b_main);
             }
         }
 
@@ -715,32 +1508,64 @@ int main(int argc, char** argv) {
             check(cudaStreamSynchronize(streams[d]), "stream sync");
         }
 
-        // Progress
+        // Progress — cumulative samples include samples_done_at_start (resume offset).
         double elapsed = now_seconds() - t_start;
         double frac    = (double)round_end / (double)launches_per_device;
         double eta     = (frac > 0) ? (elapsed / frac - elapsed) : 0.0;
-        unsigned long long samples_done = round_end * samples_per_launch * (unsigned long long)n_devices;
-        fprintf(stderr, "  round %4llu / %llu  (%5.1f%%)  samples %llu  elapsed %7.1fs  ETA %7.1fs  rate %.1f M/s\n",
+        unsigned long long samples_this_run = round_end * samples_per_launch * (unsigned long long)n_devices;
+        samples_done_total = samples_done_at_start + samples_this_run;
+        fprintf(stderr, "  round %4llu / %llu  (%5.1f%%)  samples %llu (this-run %llu)  elapsed %7.1fs  ETA %7.1fs  rate %.1f M/s\n",
             (unsigned long long)(round + 1), (unsigned long long)n_rounds,
             frac * 100.0,
-            samples_done, elapsed, eta,
-            (double)samples_done / elapsed / 1e6);
+            (unsigned long long)samples_done_total,
+            (unsigned long long)samples_this_run,
+            elapsed, eta,
+            (double)samples_this_run / elapsed / 1e6);
 
         // Checkpoint if requested (and not the very last round — final save handles that)
         if (checkpoint_every_rounds > 0 &&
             (round + 1) % (unsigned long long)checkpoint_every_rounds == 0 &&
             (round + 1) < n_rounds) {
             std::string path = cp_path(round + 1);
-            fprintf(stderr, "  checkpoint at round %llu...\n", (unsigned long long)(round + 1));
+            fprintf(stderr, "  checkpoint at round %llu (cumulative samples %llu)...\n",
+                (unsigned long long)(round + 1), (unsigned long long)samples_done_total);
             double t_cp = now_seconds();
             save_image(path);
             fprintf(stderr, "  checkpoint took %.1fs\n", now_seconds() - t_cp);
         }
+
+        // §B7: early-break if cumulative samples have reached target. Avoids
+        // overshooting on resume where launches_per_device was sized for the full
+        // target_samples; we may have extra rounds queued that aren't needed.
+        if (samples_done_total >= total_samples) {
+            fprintf(stderr, "  reached target %llu samples (cumulative %llu); breaking out of render loop\n",
+                (unsigned long long)total_samples, (unsigned long long)samples_done_total);
+            break;
+        }
+
+        // SIGUSR1 graceful-terminate (cloud watchdog wallclock-cap path).
+        // The handler set this flag asynchronously; the round just synced so it
+        // is safe to break, run the final save with whatever samples we have,
+        // and exit 0. Output is .bin + .png at the partial-but-clean state.
+        if (g_terminate_requested.load()) {
+            fprintf(stderr, "  SIGUSR1 received; graceful-terminate at round %llu (cumulative %llu samples)\n",
+                (unsigned long long)(round + 1), (unsigned long long)samples_done_total);
+            break;
+        }
     }
     double t_compute = now_seconds() - t_start;
-    fprintf(stderr, "Compute total   : %.2f s  (%.1f M samples / s aggregate)\n",
-        t_compute,
-        (double)actual_total_samples / t_compute / 1e6);
+    unsigned long long this_run_samples = (samples_done_total > samples_done_at_start)
+        ? (samples_done_total - samples_done_at_start) : 0ULL;
+    if (t_compute > 0.001) {
+        fprintf(stderr, "Compute total   : %.2f s  (%.1f M samples / s aggregate, %llu this-run, %llu cumulative)\n",
+            t_compute,
+            (double)this_run_samples / t_compute / 1e6,
+            (unsigned long long)this_run_samples,
+            (unsigned long long)samples_done_total);
+    } else {
+        fprintf(stderr, "Compute total   : <0.001s (loop skipped, cumulative %llu samples from resume)\n",
+            (unsigned long long)samples_done_total);
+    }
 
     // Final save
     fprintf(stderr, "Final save...\n");
@@ -752,6 +1577,9 @@ int main(int argc, char** argv) {
 
     // Cleanup
     if (d_staging) cudaFree(d_staging);
+    if (d_alias_table)     cudaFree(d_alias_table);
+    if (d_alias_threshold) cudaFree(d_alias_threshold);
+    if (d_imap_data)       cudaFree(d_imap_data);
     for (int d = 0; d < n_devices; d++) {
         check(cudaSetDevice(d), "set device free");
         cudaFree(d_hist[d]);

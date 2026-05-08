@@ -11,8 +11,32 @@ buddhabrot.exe
 *.jpg
 !examples/*.jpg
 
+# Histogram dumps (huge — 4.83 GB at 16K, 19.3 GB at 32K).
+# IMap is small (~4 MB) and ships with the repo for reproducibility.
+*.bin
+!imap.bin
+*.bin.tmp
+*.bin.sha256
+*.tmp
+
 # Logs
 *.log
+*.stderr.log
+*.watchdog.log
+*.watchdog.attempt
+*.watchdog.detail
+*.launch.log
+*.monitor.log
+*.hfsync.log
+
+# Watchdog / supervisor sentinels & state
+*.DONE
+*.FATAL
+*.pid
+*.stop
+*.hfsync.pid
+*.status.html
+*.watchdog.state
 
 # Python
 __pycache__/
