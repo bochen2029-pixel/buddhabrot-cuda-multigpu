@@ -33,6 +33,7 @@
 #include <cstring>
 #include <cstdint>
 #include <vector>
+#include <string>
 #include <chrono>
 #include <algorithm>
 #include "lodepng.h"
@@ -67,6 +68,11 @@ struct Params {
 
     float gamma;
     float normalization_floor;
+
+    // Per-channel "trim" multipliers applied to the channel max during tonemap.
+    // 1.0 = no change. < 1 brightens (effective max smaller). Use these to
+    // bake colorgrade into the renderer's PNG output (and into checkpoints).
+    float trim_r, trim_g, trim_b;
 
     unsigned long long seed_64;       // unique per-launch, per-device
     unsigned int       samples_per_thread;
@@ -281,10 +287,13 @@ __global__ void tonemap_kernel(
     float g_count = (float)histogram[hist_idx + 1u];
     float b_count = (float)histogram[hist_idx + 2u];
 
+    // Per-channel trim: multiplier on the effective max for tone-grading.
+    // trim < 1 brightens that channel (lower effective max → higher t).
+    // trim = 1 is the WGSL behavior.
     unsigned int max_base = pixels * 3u;
-    float r_max = fmaxf((float)histogram[max_base + 0u], P.normalization_floor);
-    float g_max = fmaxf((float)histogram[max_base + 1u], P.normalization_floor);
-    float b_max = fmaxf((float)histogram[max_base + 2u], P.normalization_floor);
+    float r_max = fmaxf((float)histogram[max_base + 0u] * P.trim_r, P.normalization_floor);
+    float g_max = fmaxf((float)histogram[max_base + 1u] * P.trim_g, P.normalization_floor);
+    float b_max = fmaxf((float)histogram[max_base + 2u] * P.trim_b, P.normalization_floor);
 
     float rt = fminf(fmaxf(r_count / r_max, 0.0f), 1.0f);
     float gt = fminf(fmaxf(g_count / g_max, 0.0f), 1.0f);
@@ -334,12 +343,28 @@ static void print_usage(const char* argv0) {
         "  --view-center-y F        camera Y (default  0.04166264380232)\n"
         "  --zoom F                 camera zoom (default 0.5)\n"
         "  --rotation-deg F         camera rotation in degrees (default 90)\n"
+        "  --sample-center-x F      sample disk center X (default 0.0)\n"
+        "  --sample-center-y F      sample disk center Y (default 0.0)\n"
+        "  --sample-radius F        sample disk radius (default 2.5)\n"
+        "  --trim-r F               red   tonemap trim multiplier (default 1.0)\n"
+        "  --trim-g F               green tonemap trim multiplier (default 1.0)\n"
+        "  --trim-b F               blue  tonemap trim multiplier (default 1.0)\n"
+        "                           (trim < 1 brightens that channel; matches\n"
+        "                            colorgrade.py with sample-count-invariant trims)\n"
+        "  --target-r F             auto-derive trim_r so effective R max = F\n"
+        "  --target-g F             auto-derive trim_g so effective G max = F\n"
+        "  --target-b F             auto-derive trim_b so effective B max = F\n"
+        "                           (overrides --trim-* if set; computed at end\n"
+        "                            of render from the measured channel maxes)\n"
         "  --blocks N               CUDA blocks per launch (default 4096)\n"
         "  --threads N              CUDA threads per block (default 256)\n"
         "  --samples-per-thread N   samples per thread per launch (default 1024)\n"
         "  --base-seed N            RNG base seed (uint64, default time-derived)\n"
         "  --devices N              number of GPUs to use (default: all available)\n"
         "  --launches-per-round N   sync/report cadence (default 8)\n"
+        "  --checkpoint-every N     merge+tonemap+save every N rounds (default 0=off)\n"
+        "                           (each checkpoint writes <output>.cpNNNN.png;\n"
+        "                            safe to interrupt — latest cp is usable)\n"
         "  --help                   show this message\n",
         argv0);
 }
@@ -368,6 +393,19 @@ int main(int argc, char** argv) {
     int requested_devices       = 0;       // 0 = all
     int launches_per_round      = 8;
 
+    double sample_center_x      = 0.0;
+    double sample_center_y      = 0.0;
+    double sample_radius        = 2.5;
+
+    double trim_r               = 1.0;
+    double trim_g               = 1.0;
+    double trim_b               = 1.0;
+    double target_r             = 0.0;     // 0 = unset, derive from --trim-r
+    double target_g             = 0.0;
+    double target_b             = 0.0;
+
+    int checkpoint_every_rounds = 0;       // 0 = no checkpoints
+
     // CLI
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -386,12 +424,22 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--view-center-y"))      view_center_y = atof(need(a));
         else if (!strcmp(a, "--zoom"))               zoom = atof(need(a));
         else if (!strcmp(a, "--rotation-deg"))       rotation_deg = atof(need(a));
+        else if (!strcmp(a, "--sample-center-x"))    sample_center_x = atof(need(a));
+        else if (!strcmp(a, "--sample-center-y"))    sample_center_y = atof(need(a));
+        else if (!strcmp(a, "--sample-radius"))      sample_radius = atof(need(a));
+        else if (!strcmp(a, "--trim-r"))             trim_r = atof(need(a));
+        else if (!strcmp(a, "--trim-g"))             trim_g = atof(need(a));
+        else if (!strcmp(a, "--trim-b"))             trim_b = atof(need(a));
+        else if (!strcmp(a, "--target-r"))           target_r = atof(need(a));
+        else if (!strcmp(a, "--target-g"))           target_g = atof(need(a));
+        else if (!strcmp(a, "--target-b"))           target_b = atof(need(a));
         else if (!strcmp(a, "--blocks"))             blocks_per_launch = atoi(need(a));
         else if (!strcmp(a, "--threads"))            threads_per_block = atoi(need(a));
         else if (!strcmp(a, "--samples-per-thread")) samples_per_thread = (unsigned)atoi(need(a));
         else if (!strcmp(a, "--base-seed"))          base_seed = strtoull(need(a), nullptr, 10);
         else if (!strcmp(a, "--devices"))            requested_devices = atoi(need(a));
         else if (!strcmp(a, "--launches-per-round")) launches_per_round = atoi(need(a));
+        else if (!strcmp(a, "--checkpoint-every"))   checkpoint_every_rounds = atoi(need(a));
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { print_usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown arg: %s\n", a); print_usage(argv[0]); return 1; }
     }
@@ -410,9 +458,9 @@ int main(int argc, char** argv) {
     P.exponent_x                  = 2.0f;
     P.exponent_y                  = 0.0f;
     P.anti                        = 0;
-    P.sample_center_x             = 0.0f;
-    P.sample_center_y             = 0.0f;
-    P.sample_radius               = 2.5f;
+    P.sample_center_x             = (float)sample_center_x;
+    P.sample_center_y             = (float)sample_center_y;
+    P.sample_radius               = (float)sample_radius;
     P.uniform_sample_distribution = 1;
     P.bailout_radius_sq           = 16.0f;
     P.max_iter_1                  = max_iter_r;
@@ -420,6 +468,9 @@ int main(int argc, char** argv) {
     P.max_iter_3                  = max_iter_b;
     P.gamma                       = 4.0f;
     P.normalization_floor         = 15.0f;
+    P.trim_r                      = (float)trim_r;
+    P.trim_g                      = (float)trim_g;
+    P.trim_b                      = (float)trim_b;
     P.samples_per_thread          = samples_per_thread;
 
     // Memory budget
@@ -518,7 +569,119 @@ int main(int argc, char** argv) {
         (unsigned long long)(launches_per_device * samples_per_launch));
     fprintf(stderr, "Aggregate       : %llu samples across %d devices\n",
         (unsigned long long)actual_total_samples, n_devices);
+    if (checkpoint_every_rounds > 0) {
+        fprintf(stderr, "Checkpoints     : every %d round(s)\n", checkpoint_every_rounds);
+    }
     fprintf(stderr, "===========================================\n");
+
+    // Allocate the merge staging buffer once (kept for reuse at every checkpoint).
+    unsigned int* d_staging = nullptr;
+    if (n_devices > 1) {
+        check(cudaSetDevice(0), "set dev 0 staging");
+        check(cudaMalloc(&d_staging, hist_bytes), "cudaMalloc staging");
+    }
+
+    // -----------------------------------------------------------------------
+    // save_image: merge per-device histograms onto device 0 (destructive — zeroes
+    // d_hist[1..N-1] so future rounds accumulate fresh deltas), recompute channel
+    // maxes, optionally derive trim from --target-* flags, tonemap, save PNG.
+    //
+    // Safe to call mid-render (checkpoint) or at the end (final). After return,
+    // d_hist[0] contains the cumulative total and is ready to keep accumulating.
+    // -----------------------------------------------------------------------
+    auto save_image = [&](const std::string& path) -> bool {
+        check(cudaSetDevice(0), "set dev 0 in save");
+
+        // Merge if multi-GPU
+        if (n_devices > 1) {
+            unsigned int n_pixel_words = (unsigned int)pixels * 3u;
+            unsigned int blocks_sum    = (n_pixel_words + 255u) / 256u;
+            for (int d = 1; d < n_devices; d++) {
+                check(cudaMemcpyPeer(d_staging, 0, d_hist[d], d, hist_bytes), "memcpy peer");
+                sum_pixels_kernel<<<blocks_sum, 256>>>(d_hist[0], d_staging, n_pixel_words);
+                check(cudaGetLastError(), "sum_pixels launch");
+                // Zero out the peer histogram so the next round starts fresh —
+                // prevents double-counting at the next merge.
+                check(cudaSetDevice(d), "set dev d for zero");
+                check(cudaMemset(d_hist[d], 0, hist_bytes), "zero peer hist");
+                check(cudaSetDevice(0), "back to dev 0");
+            }
+            // Recompute master max slots from the merged pixel data.
+            check(cudaMemset(d_hist[0] + pixels * 3, 0, 3 * sizeof(unsigned int)),
+                  "zero master max slots");
+            compute_max_kernel<<<blocks_sum, 256>>>(d_hist[0], (unsigned int)pixels);
+            check(cudaDeviceSynchronize(), "merge max sync");
+        }
+
+        // Read channel maxima for diagnostics + optional auto-trim derivation.
+        std::vector<unsigned int> tail(3);
+        check(cudaMemcpy(tail.data(), d_hist[0] + pixels * 3, 3 * sizeof(unsigned int),
+                         cudaMemcpyDeviceToHost), "memcpy tail");
+        fprintf(stderr, "  channel maxes  R=%u  G=%u  B=%u\n", tail[0], tail[1], tail[2]);
+        if (tail[0] > 0xC0000000u || tail[1] > 0xC0000000u || tail[2] > 0xC0000000u) {
+            fprintf(stderr, "  WARNING: channel max >75%% of UINT32_MAX — reduce samples or upgrade hist to u64.\n");
+        }
+
+        Params local_P = P;
+        if (target_r > 0.0 || target_g > 0.0 || target_b > 0.0) {
+            if (target_r > 0.0 && tail[0] > 0u) local_P.trim_r = (float)(target_r / (double)tail[0]);
+            if (target_g > 0.0 && tail[1] > 0u) local_P.trim_g = (float)(target_g / (double)tail[1]);
+            if (target_b > 0.0 && tail[2] > 0u) local_P.trim_b = (float)(target_b / (double)tail[2]);
+            fprintf(stderr, "  auto-trim      r=%.4f  g=%.4f  b=%.4f\n",
+                local_P.trim_r, local_P.trim_g, local_P.trim_b);
+        }
+
+        // Tonemap
+        dim3 tm_threads(16, 16);
+        dim3 tm_blocks((width + 15) / 16, (height + 15) / 16);
+        tonemap_kernel<<<tm_blocks, tm_threads>>>(d_hist[0], d_out, local_P);
+        check(cudaDeviceSynchronize(), "tonemap sync");
+
+        // Copy out
+        std::vector<unsigned char> host_be(out_bytes);
+        check(cudaMemcpy(host_be.data(), d_out, out_bytes, cudaMemcpyDeviceToHost), "memcpy out");
+
+        // Encode 16-bit PNG
+        lodepng::State state;
+        state.info_raw.bitdepth          = 16;
+        state.info_raw.colortype         = LCT_RGB;
+        state.info_png.color.bitdepth    = 16;
+        state.info_png.color.colortype   = LCT_RGB;
+        state.encoder.auto_convert       = 0;
+        state.encoder.zlibsettings.windowsize = 1024;
+        state.encoder.zlibsettings.nicematch  = 64;
+
+        std::vector<unsigned char> png;
+        unsigned err = lodepng::encode(png, host_be, (unsigned)width, (unsigned)height, state);
+        if (err) {
+            fprintf(stderr, "  lodepng encode error %u: %s\n", err, lodepng_error_text(err));
+            return false;
+        }
+        err = lodepng::save_file(png, path);
+        if (err) {
+            fprintf(stderr, "  lodepng save error %u: %s\n", err, lodepng_error_text(err));
+            return false;
+        }
+        fprintf(stderr, "  -> %s  (%.1f MB)\n", path.c_str(), (double)png.size() / (1024.0*1024.0));
+        return true;
+    };
+
+    // Helper: build "<basename>.cpNNNN.png" path for checkpoint saves.
+    auto cp_path = [&](unsigned long long n) -> std::string {
+        std::string base = output_path;
+        auto dot = base.rfind('.');
+        char buf[2048];
+        if (dot != std::string::npos && dot > 0) {
+            snprintf(buf, sizeof(buf), "%.*s.cp%04llu%s",
+                     (int)dot, base.c_str(),
+                     (unsigned long long)n,
+                     base.c_str() + dot);
+        } else {
+            snprintf(buf, sizeof(buf), "%s.cp%04llu", base.c_str(),
+                     (unsigned long long)n);
+        }
+        return buf;
+    };
 
     // Kernel launch loop — round-robin over devices, sync every `launches_per_round`
     double t_start = now_seconds();
@@ -538,8 +701,6 @@ int main(int argc, char** argv) {
             check(cudaSetDevice(d), "set device launch");
             for (unsigned long long L = round_start; L < round_end; L++) {
                 Params local_P = P;
-                // Unique 64-bit seed per (device, launch). Mixing constants are
-                // odd, large, and pairwise-coprime to avoid arithmetic patterns.
                 local_P.seed_64 = base_seed
                                 ^ ((unsigned long long)d * 0xC2B2AE3D27D4EB4FULL)
                                 ^ (L                   * 0x9E3779B97F4A7C15ULL);
@@ -564,106 +725,40 @@ int main(int argc, char** argv) {
             frac * 100.0,
             samples_done, elapsed, eta,
             (double)samples_done / elapsed / 1e6);
+
+        // Checkpoint if requested (and not the very last round — final save handles that)
+        if (checkpoint_every_rounds > 0 &&
+            (round + 1) % (unsigned long long)checkpoint_every_rounds == 0 &&
+            (round + 1) < n_rounds) {
+            std::string path = cp_path(round + 1);
+            fprintf(stderr, "  checkpoint at round %llu...\n", (unsigned long long)(round + 1));
+            double t_cp = now_seconds();
+            save_image(path);
+            fprintf(stderr, "  checkpoint took %.1fs\n", now_seconds() - t_cp);
+        }
     }
     double t_compute = now_seconds() - t_start;
     fprintf(stderr, "Compute total   : %.2f s  (%.1f M samples / s aggregate)\n",
         t_compute,
         (double)actual_total_samples / t_compute / 1e6);
 
-    // -----------------------------------------------------------------------
-    // Merge: peer-copy each device's histogram into a staging buffer on dev 0,
-    // sum into the master, then recompute channel maxes from the merged data.
-    // -----------------------------------------------------------------------
-    check(cudaSetDevice(0), "set dev 0 merge");
-    if (n_devices > 1) {
-        fprintf(stderr, "Merging %d histograms onto device 0...\n", n_devices);
-        double t_merge_start = now_seconds();
-
-        unsigned int* d_staging = nullptr;
-        check(cudaMalloc(&d_staging, hist_bytes), "cudaMalloc staging");
-
-        unsigned int n_pixel_words = (unsigned int)pixels * 3u;
-        unsigned int blocks_sum    = (n_pixel_words + 255u) / 256u;
-
-        for (int d = 1; d < n_devices; d++) {
-            check(cudaMemcpyPeer(d_staging, 0, d_hist[d], d, hist_bytes), "memcpy peer");
-            sum_pixels_kernel<<<blocks_sum, 256>>>(d_hist[0], d_staging, n_pixel_words);
-            check(cudaGetLastError(), "sum_pixels launch");
-        }
-        check(cudaDeviceSynchronize(), "merge sum sync");
-        check(cudaFree(d_staging), "free staging");
-
-        // Recompute channel max slots from the merged pixel data.
-        check(cudaMemset(d_hist[0] + pixels * 3, 0, 3 * sizeof(unsigned int)), "zero max slots");
-        compute_max_kernel<<<blocks_sum, 256>>>(d_hist[0], (unsigned int)pixels);
-        check(cudaDeviceSynchronize(), "merge max sync");
-
-        fprintf(stderr, "Merge           : %.2f s\n", now_seconds() - t_merge_start);
-    }
-
-    // Free non-master device histograms (master freed after tonemap)
-    for (int d = 1; d < n_devices; d++) {
-        check(cudaSetDevice(d), "set device free");
-        check(cudaFree(d_hist[d]), "free hist d");
-    }
-    for (int d = 0; d < n_devices; d++) {
-        check(cudaSetDevice(d), "set device stream free");
-        cudaStreamDestroy(streams[d]);
-    }
-    check(cudaSetDevice(0), "set dev 0 tonemap");
-
-    // Tonemap
-    fprintf(stderr, "Tonemap...\n");
-    double t_tm_start = now_seconds();
-    dim3 tm_threads(16, 16);
-    dim3 tm_blocks((width + 15) / 16, (height + 15) / 16);
-    tonemap_kernel<<<tm_blocks, tm_threads>>>(d_hist[0], d_out, P);
-    check(cudaDeviceSynchronize(), "tonemap sync");
-    fprintf(stderr, "Tonemap         : %.2f s\n", now_seconds() - t_tm_start);
-
-    // Channel maxima diagnostics
-    std::vector<unsigned int> tail(3);
-    check(cudaMemcpy(tail.data(), d_hist[0] + pixels * 3, 3 * sizeof(unsigned int),
-                     cudaMemcpyDeviceToHost), "memcpy tail");
-    fprintf(stderr, "Channel maxima  : R=%u  G=%u  B=%u\n", tail[0], tail[1], tail[2]);
-    if (tail[0] > 0xC0000000u || tail[1] > 0xC0000000u || tail[2] > 0xC0000000u) {
-        fprintf(stderr, "  WARNING: a channel max is >75%% of UINT32_MAX. Reduce samples or upgrade hist to u64.\n");
-    }
-    check(cudaFree(d_hist[0]), "free master hist");
-
-    // Pull tonemapped image (already big-endian for PNG)
-    fprintf(stderr, "Copy out...\n");
-    double t_copy_start = now_seconds();
-    std::vector<unsigned char> host_be(out_bytes);
-    check(cudaMemcpy(host_be.data(), d_out, out_bytes, cudaMemcpyDeviceToHost), "memcpy out");
-    cudaFree(d_out);
-    fprintf(stderr, "Copy            : %.2f s\n", now_seconds() - t_copy_start);
-
-    // Encode 16-bit PNG
-    fprintf(stderr, "Encode PNG...\n");
-    double t_enc_start = now_seconds();
-    lodepng::State state;
-    state.info_raw.bitdepth          = 16;
-    state.info_raw.colortype         = LCT_RGB;
-    state.info_png.color.bitdepth    = 16;
-    state.info_png.color.colortype   = LCT_RGB;
-    state.encoder.auto_convert       = 0;
-    state.encoder.zlibsettings.windowsize = 1024;
-    state.encoder.zlibsettings.nicematch  = 64;
-
-    std::vector<unsigned char> png;
-    unsigned err = lodepng::encode(png, host_be, (unsigned)width, (unsigned)height, state);
-    if (err) {
-        fprintf(stderr, "lodepng encode error %u: %s\n", err, lodepng_error_text(err));
+    // Final save
+    fprintf(stderr, "Final save...\n");
+    double t_final = now_seconds();
+    if (!save_image(output_path)) {
         return 2;
     }
-    err = lodepng::save_file(png, output_path);
-    if (err) {
-        fprintf(stderr, "lodepng save error %u: %s\n", err, lodepng_error_text(err));
-        return 3;
+    fprintf(stderr, "Final save took %.2f s\n", now_seconds() - t_final);
+
+    // Cleanup
+    if (d_staging) cudaFree(d_staging);
+    for (int d = 0; d < n_devices; d++) {
+        check(cudaSetDevice(d), "set device free");
+        cudaFree(d_hist[d]);
+        cudaStreamDestroy(streams[d]);
     }
-    fprintf(stderr, "Encode + save   : %.2f s   (file size: %.1f MB)\n",
-        now_seconds() - t_enc_start, (double)png.size() / (1024.0 * 1024.0));
+    cudaSetDevice(0);
+    cudaFree(d_out);
 
     fprintf(stderr, "===========================================\n");
     fprintf(stderr, "TOTAL           : %.2f s -> %s\n", now_seconds() - t_start, output_path);
