@@ -44,25 +44,30 @@ log() {
     echo "[watchdog $(date -u +%H:%M:%S)] $*" | tee -a "$WATCHDOG_LOG" >&2
 }
 
-# Background HF sync helper (one-shot per checkpoint)
+# Background HF sync helper (one-shot per checkpoint).
+# Uses `hf sync` with the bucket URL form. The `hf upload --repo-type bucket`
+# variant errors out because the CLI restricts repo-type to model/dataset/space.
+# `hf sync <localdir> hf://buckets/<user>/<bucket>/<remote_subdir>` is the
+# documented and working bucket-upload path.
 hf_sync_one() {
     local fpath="$1"
     if [ "$HF_SYNC_ENABLED" != "1" ]; then return; fi
     if [ -z "$HF_BUCKET" ]; then return; fi
     local bn
     bn=$(basename "$fpath")
+    local fdir
+    fdir=$(dirname "$fpath")
+    [ -z "$fdir" ] && fdir="."
     local synclog="${fpath}.hfsync.log"
     log "  HF sync $bn -> hf://buckets/$HF_BUCKET (background)"
     (
         if command -v hf >/dev/null 2>&1; then
-            hf upload --repo-type bucket "$HF_BUCKET" "$fpath" "$bn" \
-                --commit-message "watchdog cp $(date -u +%Y%m%dT%H%M%SZ)" \
+            # hf sync requires a directory as source; use --include to scope to one file.
+            hf sync "$fdir" "hf://buckets/$HF_BUCKET/" --include "$bn" \
                 > "$synclog" 2>&1 \
                 || echo "[hf-sync FAIL] $bn" >> "$synclog"
-        elif command -v huggingface-cli >/dev/null 2>&1; then
-            huggingface-cli upload --repo-type bucket "$HF_BUCKET" "$fpath" "$bn" \
-                > "$synclog" 2>&1 \
-                || echo "[hf-sync FAIL] $bn" >> "$synclog"
+        else
+            echo "[hf-sync SKIP] hf CLI not found" >> "$synclog"
         fi
     ) &
     echo "$!" > "${fpath}.hfsync.pid"
