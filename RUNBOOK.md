@@ -1,8 +1,10 @@
-# RUNBOOK — 8× H200 / H100 × 32K Buddhabrot render on Hyperbolic.xyz
+# RUNBOOK — Cloud Buddhabrot render (1× / 8× H100/H200)
 
 **Audience:** human operator (Bo), or any AI assistant the human is collaborating with. This document is self-contained — read top to bottom or jump to a phase.
 
-**Last revision:** 2026-05-08. Tested on Windows 11 Pro + MobaXterm + Hyperbolic.xyz Linux VM with 8× H200 SXM5 GPUs.
+**Last revision:** 2026-05-08. Original target was Hyperbolic.xyz 8× H200; pivoted to RunPod after first attempt. Provider recommendations and lessons learned section at the bottom of this document supersede earlier provider-specific instructions.
+
+> **⚠️ Read first: [Lessons from first cloud attempt](#lessons-from-first-cloud-attempt) at the bottom.** It documents what went wrong and which provider tier to use. The phase-by-phase walkthrough below assumed Hyperbolic; for RunPod or Lambda use the bootstrap one-liner identically but follow the provider-specific notes in the lessons section.
 
 ---
 
@@ -871,6 +873,124 @@ hf download --repo-type bucket bochen2079/buddhabrot <name> --local-dir .  # pul
 mv buddhabrot_cloud_32k_2T.cp0XXX.bin buddhabrot_cloud_32k_2T.bin
 ./run-cloud-hyperbolic.sh    # auto-detects .bin and resumes
 ```
+
+---
+
+## Final words
+
+**The render is the goal. The .bin is the artifact. The PNG is derivative.**
+
+If anything goes wrong but you have the .bin, you can:
+- Re-tonemap with different trims in 3 min
+- Convert to EXR for graphics-pipeline use
+- Resume from this point on a fresh instance
+- Archive forever and regenerate any size PNG later
+
+If you have the PNG but lost the .bin, you have a frozen image you cannot improve.
+
+**Therefore: when in doubt, save the .bin first. The HF bucket sync is doing this for you automatically. Trust it, but verify by checking the bucket UI mid-render.**
+
+---
+
+## Lessons from first cloud attempt
+
+**Date of attempt:** 2026-05-08. Pod: RunPod Community Cloud 1× H100 80GB HBM3 at $2.99/hr. Outcome: render functioned but throughput was 12.1 M/s vs expected 40-60 M/s (3-5× slower). Diagnosed as shared-tenancy HBM bandwidth contention. **Switch providers next time.**
+
+### Provider selection — the big lesson
+
+| Provider tier | Verdict | Reason |
+|---|---|---|
+| **RunPod Secure Cloud** | ✅ recommended | Dedicated tenancy, full bandwidth, ~$2.49-3.99/hr |
+| **Lambda Labs** | ✅ recommended | Dedicated, simple SSH UX, $2.49/hr H100 PCIe |
+| **Vast.ai** (datacenter listings) | ✅ acceptable | Cheaper, dedicated nodes available, marketplace UX |
+| RunPod Community Cloud | ❌ avoid | Shared HBM bandwidth, throttled at 12 M/s on H100 |
+| Hyperbolic.xyz | ❌ avoid | Single-key SSH UX makes provisioning painful |
+
+### How to detect a throttled/shared GPU
+
+The smoking gun: **power draw vs cap with 100% util**. Run on the pod immediately after launching the render:
+```bash
+nvidia-smi --query-gpu=power.draw,power.limit,utilization.gpu --format=csv,noheader
+```
+
+Expected for H100 doing real work: 600-700W of 700W cap (90-100% of power).
+If you see <30% of power cap with 100% util → the SMs are stalled on HBM atomics → shared-tenant bandwidth contention. **No kernel parameter fixes this. Switch pods.**
+
+Observed in the failed attempt: `100%, 6303 MiB, 146.43 W, 30°C` → 21% of cap → confirmed throttled.
+
+### HF bucket sync — the working syntax
+
+The `hf upload --repo-type bucket` command in the original watchdog **does not work** (HF CLI restricts repo-type to `model`/`dataset`/`space`). Buckets must be addressed via the URL form:
+
+```bash
+hf sync . hf://buckets/<user>/<bucket>/ --include "*.bin" --include "*.png" --include "*.log"
+```
+
+Verified working 2026-05-08. Fixed in commit [`088fefb`](https://github.com/bochen2029-pixel/buddhabrot-cuda-multigpu/commit/088fefb). Pre-fix watchdogs need `git pull` before relaunching.
+
+**Auth:** must run loudly, never with `2>/dev/null`:
+```bash
+hf auth login --token "$HF_TOKEN"
+hf auth whoami       # MUST print username, not "Not logged in"
+```
+
+### Settings that don't help atomic-bound throughput
+
+Reject any advice to bump `SAMPLES_PER_THREAD` above 32 to fix throughput. The Buddhabrot IS kernel at 16K is HBM-atomic-bound, not launch-overhead-bound:
+- Per-launch wallclock at 12 M/s with `samples_per_thread=32`: 2.79 sec
+- CUDA kernel launch overhead: 50 μs
+- Overhead fraction: 0.002% of launch time
+
+Increasing samples_per_thread to 1024 makes launches 32× longer for zero throughput gain and worse progress visibility. The bottleneck is HBM atomic contention, fixed only by:
+1. Different memory architecture (per-block private histograms, tiled merge) — kernel rewrite
+2. Different hardware (better HBM atomic throughput)
+3. **Dedicated tenancy** (the immediate practical answer)
+
+### RunPod-specific notes
+
+- **Web Terminal** (browser) is full bash shell — equivalent to SSH for our purposes. Use this and skip SSH key drama entirely.
+- **Pod template:** `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` — has nvcc preinstalled. Critical: the **`-devel`** suffix. Runtime-only images won't compile.
+- **SSH key registration:** https://www.runpod.io/console/user/settings → SSH public keys. Multiple keys allowed (newline-separated). Auto-injects to all newly-deployed pods.
+- **Filter Secure Cloud at deploy time** — Community is the cheap shared tier; Secure is dedicated. The price difference ($2.99 vs $3.49) buys 3-5× actual throughput.
+
+### Bootstrap script bugs (now fixed)
+
+These hit on the first attempt; fixed in commits below the original release:
+
+- [`6f9360a`](https://github.com/bochen2029-pixel/buddhabrot-cuda-multigpu/commit/6f9360a) — bootstrap was trying to `cd cuda-render-16k/` (subdirectory doesn't exist; renderer files are at repo root).
+- [`603e67a`](https://github.com/bochen2029-pixel/buddhabrot-cuda-multigpu/commit/603e67a) — `--target-[rgb]` banned-pattern guard self-detected its own regex literal.
+- [`088fefb`](https://github.com/bochen2029-pixel/buddhabrot-cuda-multigpu/commit/088fefb) — HF watchdog used `hf upload --repo-type bucket` (broken syntax).
+
+Always `git pull` before relaunch on a long-running pod to pick up fixes.
+
+### Configuration tested working on dedicated H100
+
+For the next attempt on RunPod Secure Cloud or Lambda Labs:
+
+```bash
+export HF_TOKEN=<your_token>
+export WIDTH=16384
+export HEIGHT=12288
+export TARGET_SAMPLES=400000000000   # 400B IS at 16K
+export N_DEVICES=1
+export TRIM_R=0.57
+export TRIM_G=0.39
+export TRIM_B=0.22
+export LAUNCHES_PER_ROUND=32         # NOT 4 — keep small launches for progress visibility
+export SAMPLES_PER_THREAD=32         # NOT 1024 — bigger doesn't help atomic-bound kernel
+export CHECKPOINT_EVERY=47
+export WALLCLOCK_HARD_CAP=7200
+export SIGUSR1_LEAD=300
+export OUTPUT_BASE=buddhabrot_cloud_16k_400B
+./run-cloud-hyperbolic.sh
+```
+
+Predicted trims at 16K @ 400B IS, derived from `count_p50/R_max ∝ N^0.388`:
+- `trim_R = 0.57` (from 0.00220 × 7.65 / 0.0294)
+- `trim_G = 0.39`
+- `trim_B = 0.22`
+
+Expected wallclock at dedicated 50 M/s: ~2h. SIGUSR1 fires at T-300s if under-budget; .bin saves regardless.
 
 ---
 
