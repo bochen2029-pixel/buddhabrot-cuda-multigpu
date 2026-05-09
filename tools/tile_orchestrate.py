@@ -254,32 +254,133 @@ if __name__ == "__main__":
         for t, s, m in zip(spec["tiles"], per_tile_samples, tile_masses):
             print(f"  tile {t['id']}: {s:>15,d} samples ({100*m/total_mass:.1f}%)")
 
-        # Emit render_tiles.sh
-        render_sh = out_dir / "render_tiles.sh"
-        with open(render_sh, "w", newline="\n") as f:
+        # Emit Phase 2 production scripts. Two-stage validation pattern:
+        #   render_tiles_validation.sh — first 2 tiles only (~50-100 min)
+        #   render_tiles_remaining.sh   — remaining tiles after user validates seam
+        # Each tile call passes --checkpoint-every from the spec; default 0
+        # means no intermediate checkpoints (each tile IS its own recovery
+        # unit; per-tile final save is mandatory and HF-synced automatically).
+        # If you want all tiles in one go, just `cat` the two scripts together.
+
+        def write_tile_block(f, t, s):
+            imap_path = f"tile_{t['id']}.imap"
+            out_png   = f"tile_{t['id']}.png"
+            cp_every  = spec.get('checkpoint_every', 0)
+            f.write(f"echo \"=== [$(date -u +%H:%M:%S)] tile {t['id']}: {s:,} samples ===\"\n")
+            f.write(f"{spec['buddhabrot_bin']} \\\n")
+            f.write(f"    --imap {imap_path} \\\n")
+            f.write(f"    --samples {s} \\\n")
+            f.write(f"    --width {t['width']} --height {t['height']} \\\n")
+            f.write(f"    --view-center-x {t['center_re']:.16f} \\\n")
+            f.write(f"    --view-center-y {t['center_im']:.16f} \\\n")
+            f.write(f"    --zoom {t['zoom_apron']:.10f} \\\n")
+            f.write(f"    --rotation-deg {spec['rotation_deg']} \\\n")
+            f.write(f"    --sample-radius {spec['sample_radius']} \\\n")
+            f.write(f"    --iter-r {spec['iter_r']} --iter-g {spec['iter_g']} --iter-b {spec['iter_b']} \\\n")
+            f.write(f"    --devices {spec['devices']} \\\n")
+            f.write(f"    --launches-per-round {spec['launches_per_round']} \\\n")
+            f.write(f"    --samples-per-thread {spec['samples_per_thread']} \\\n")
+            f.write(f"    --checkpoint-every {cp_every} \\\n")
+            f.write(f"    --output {out_png}\n")
+            # Background HF sync after this tile lands.
+            f.write(f"if [ -n \"${{HF_TOKEN:-}}\" ] && [ -n \"${{HF_BUCKET:-}}\" ]; then\n")
+            f.write(f"    nohup hf sync . hf://buckets/$HF_BUCKET/ "
+                    f"--include 'tile_{t['id']}.bin' --include 'tile_{t['id']}.png' "
+                    f"> hfsync_{t['id']}.log 2>&1 &\n")
+            f.write(f"    echo \"  [hf-sync] dispatched tile {t['id']} to HF bucket (bg)\"\n")
+            f.write(f"fi\n\n")
+
+        def write_script_header(f, title, recommended_timeout_sec):
             f.write("#!/usr/bin/env bash\n")
-            f.write("# Phase 2: production tile renders with proportional allocation.\n")
+            f.write(f"# Phase 2 — {title}\n")
+            f.write(f"#\n")
+            f.write(f"# RECOMMENDED INVOCATION (with hard wallclock cap):\n")
+            f.write(f"#   timeout {recommended_timeout_sec} bash $(basename $0)\n")
+            f.write(f"#\n")
+            f.write(f"# OPTIONAL Linux-level safety net (in addition):\n")
+            f.write(f"#   sudo shutdown +{recommended_timeout_sec // 60 + 30}\n")
+            f.write(f"#   # shuts down the pod in {recommended_timeout_sec // 60 + 30} min if you forget;\n")
+            f.write(f"#   # cancel with: sudo shutdown -c\n")
+            f.write(f"#\n")
+            f.write(f"# HF sync: set HF_TOKEN and HF_BUCKET env (e.g. bochen2079/buddhabrot)\n")
+            f.write(f"# before running, and each tile auto-pushes to HF on completion.\n")
             f.write("set -euo pipefail\n")
-            f.write(f'cd "$(dirname "$0")"\n\n')
+            f.write(f'cd "$(dirname "$0")"\n')
+            f.write(f"START=$(date +%s)\n")
+            f.write(f"echo \"=== Phase 2 START $(date -u) ===\"\n\n")
+
+        def write_script_footer(f):
+            f.write("END=$(date +%s)\n")
+            f.write("ELAPSED=$((END - START))\n")
+            f.write("echo \"=== Phase 2 END $(date -u)  elapsed ${ELAPSED}s = $((ELAPSED/60))min ===\"\n")
+            f.write("echo \"\"\n")
+            f.write("# Wait for any in-flight HF sync background jobs to finish.\n")
+            f.write("if compgen -G 'hfsync_*.log' > /dev/null; then\n")
+            f.write("    echo 'Waiting for HF sync background jobs to finish (max 600s)...'\n")
+            f.write("    SYNC_DEADLINE=$(($(date +%s) + 600))\n")
+            f.write("    while [ $(date +%s) -lt $SYNC_DEADLINE ]; do\n")
+            f.write("        if ! pgrep -f 'hf sync' >/dev/null 2>&1; then break; fi\n")
+            f.write("        sleep 5\n")
+            f.write("    done\n")
+            f.write("    echo 'HF sync wait done.'\n")
+            f.write("fi\n")
+
+        # Estimated wallclock at 8x 5090 / ~122 M/s aggregate (or ~50 M/s if
+        # a 6x 4090 fallback). Conservative: assume slower path + 50% margin.
+        # Per-tile compute = total_samples / (n_tiles * aggregate_throughput).
+        # Use 50 M/s (4090 estimate) for conservative timeout.
+        est_throughput = 50_000_000  # M/s — conservative
+        validation_n_tiles = min(2, len(spec["tiles"]))
+        validation_samples = sum(per_tile_samples[:validation_n_tiles])
+        validation_compute_s = validation_samples / est_throughput
+        validation_timeout = int(validation_compute_s * 1.5) + 1800   # 50% margin + 30 min
+        full_compute_s = sum(per_tile_samples) / est_throughput
+        remaining_compute_s = (sum(per_tile_samples) - validation_samples) / est_throughput
+        remaining_timeout = int(remaining_compute_s * 1.5) + 1800
+        full_timeout = int(full_compute_s * 1.5) + 1800
+
+        # 1. render_tiles_validation.sh — first 2 tiles
+        val_sh = out_dir / "render_tiles_validation.sh"
+        with open(val_sh, "w", newline="\n") as f:
+            write_script_header(f, f"validation (first {validation_n_tiles} tiles only)", validation_timeout)
+            f.write(f"# Estimated compute: {int(validation_compute_s/60)} min "
+                    f"(~{int(validation_compute_s/3600*100)/100} hr) at conservative 50 M/s\n")
+            f.write(f"# After this completes, DOWNLOAD the .bin files from HF locally,\n")
+            f.write(f"# stitch + crossfade-compose just these {validation_n_tiles} tiles, and\n")
+            f.write(f"# pixel-peep the seam. If clean, run render_tiles_remaining.sh.\n\n")
+            for t, s in zip(spec["tiles"][:validation_n_tiles], per_tile_samples[:validation_n_tiles]):
+                write_tile_block(f, t, s)
+            write_script_footer(f)
+        print(f"wrote {val_sh}  (timeout: {validation_timeout}s = {validation_timeout//60} min)")
+
+        # 2. render_tiles_remaining.sh — remaining tiles
+        rem_sh = out_dir / "render_tiles_remaining.sh"
+        with open(rem_sh, "w", newline="\n") as f:
+            write_script_header(f, f"remaining tiles (after validation OK)", remaining_timeout)
+            f.write(f"# Estimated compute: {int(remaining_compute_s/60)} min "
+                    f"(~{int(remaining_compute_s/3600*100)/100} hr) at conservative 50 M/s\n\n")
+            for t, s in zip(spec["tiles"][validation_n_tiles:], per_tile_samples[validation_n_tiles:]):
+                write_tile_block(f, t, s)
+            write_script_footer(f)
+        print(f"wrote {rem_sh}  (timeout: {remaining_timeout}s = {remaining_timeout//60} min)")
+
+        # 3. render_tiles.sh — all tiles in one go (for "skip validation" runs)
+        all_sh = out_dir / "render_tiles.sh"
+        with open(all_sh, "w", newline="\n") as f:
+            write_script_header(f, "ALL tiles in sequence (skip validation gate)", full_timeout)
+            f.write(f"# Estimated compute: {int(full_compute_s/60)} min "
+                    f"(~{int(full_compute_s/3600*100)/100} hr) at conservative 50 M/s\n\n")
             for t, s in zip(spec["tiles"], per_tile_samples):
-                imap_path = f"tile_{t['id']}.imap"
-                out_png   = f"tile_{t['id']}.png"
-                f.write(f"echo '=== Phase 2: tile {t['id']} ({s:,} samples) ==='\n")
-                f.write(f"{spec['buddhabrot_bin']} \\\n")
-                f.write(f"    --imap {imap_path} \\\n")
-                f.write(f"    --samples {s} \\\n")
-                f.write(f"    --width {t['width']} --height {t['height']} \\\n")
-                f.write(f"    --view-center-x {t['center_re']:.16f} \\\n")
-                f.write(f"    --view-center-y {t['center_im']:.16f} \\\n")
-                f.write(f"    --zoom {t['zoom_apron']:.10f} \\\n")
-                f.write(f"    --rotation-deg {spec['rotation_deg']} \\\n")
-                f.write(f"    --sample-radius {spec['sample_radius']} \\\n")
-                f.write(f"    --iter-r {spec['iter_r']} --iter-g {spec['iter_g']} --iter-b {spec['iter_b']} \\\n")
-                f.write(f"    --devices {spec['devices']} \\\n")
-                f.write(f"    --launches-per-round {spec['launches_per_round']} \\\n")
-                f.write(f"    --samples-per-thread {spec['samples_per_thread']} \\\n")
-                f.write(f"    --output {out_png}\n\n")
-        print(f"\nwrote {render_sh}")
-        print(f"Next: cd {args.output_dir} && bash render_tiles.sh")
+                write_tile_block(f, t, s)
+            write_script_footer(f)
+        print(f"wrote {all_sh}  (timeout: {full_timeout}s = {full_timeout//60} min)")
+
+        print(f"\nNext steps:")
+        print(f"  export HF_TOKEN=<your_token>")
+        print(f"  export HF_BUCKET=bochen2079/buddhabrot")
+        print(f"  cd {args.output_dir}")
+        print(f"  timeout {validation_timeout} bash render_tiles_validation.sh    # ~{int(validation_compute_s/60)} min")
+        print(f"  # ... validate seam locally ...")
+        print(f"  timeout {remaining_timeout} bash render_tiles_remaining.sh      # ~{int(remaining_compute_s/60)} min")
     else:
         main()
