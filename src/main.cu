@@ -112,6 +112,12 @@ struct Params {
     float view_y_span;
     float view_aspect_ratio;
     float rotation;
+    // Precomputed cos(-rotation) and sin(-rotation) for world_to_pixel.
+    // Computed once on host before kernel launch; calling cos/sin per orbit
+    // step (especially in double precision) is a significant slowdown
+    // (measured 19× on view_imap_pass_kernel).
+    float cos_neg_rot;
+    float sin_neg_rot;
 
     float initial_z_x, initial_z_y;
     float exponent_x,  exponent_y;
@@ -214,9 +220,10 @@ __device__ __forceinline__ int2 world_to_pixel(float2 p, const Params& P) {
     // against atomic latency.
     double dx = (double)p.x - (double)P.view_center_x;
     double dy = (double)p.y - (double)P.view_center_y;
-    double rot_neg = -(double)P.rotation;
-    double cos_r = cos(rot_neg);
-    double sin_r = sin(rot_neg);
+    // cos/sin precomputed on host into Params (calling cos/sin per orbit step
+    // is catastrophically slow, ~19× perf hit in double precision).
+    double cos_r = (double)P.cos_neg_rot;
+    double sin_r = (double)P.sin_neg_rot;
     double off_x = cos_r * dx - sin_r * dy;
     double off_y = sin_r * dx + cos_r * dy;
     double half_w = (double)P.view_y_span * 0.5 * (double)P.view_aspect_ratio;
@@ -932,6 +939,8 @@ int main(int argc, char** argv) {
     P.view_y_span                 = (float)(4.0 / pow(2.0, zoom));
     P.view_aspect_ratio           = (float)width / (float)height;
     P.rotation                    = (float)(rotation_deg * 3.14159265358979323846 / 180.0);
+    P.cos_neg_rot                 = cosf(-P.rotation);
+    P.sin_neg_rot                 = sinf(-P.rotation);
     P.initial_z_x                 = 0.0f;
     P.initial_z_y                 = 0.0f;
     P.exponent_x                  = 2.0f;

@@ -198,6 +198,12 @@ def main():
             f.write(f"    --rotation-deg {args.rotation_deg} \\\n")
             f.write(f"    --sample-radius {args.sample_radius} \\\n")
             f.write(f"    --iter-r {args.iter_r} --iter-g {args.iter_g} --iter-b {args.iter_b} \\\n")
+            # MANDATORY samples-per-thread=8 for Windows TDR avoidance.
+            # IMap build kernel does count_iterations + orbit replay per sample;
+            # 4096*256*1024 = 1B samples/launch at ~7.5 M/s = 134 sec, well over
+            # the 2-sec Windows TDR cap. samples-per-thread=8 caps per-launch
+            # at ~1 sec, well under TDR. See CLAUDE.md B11.
+            f.write(f"    --samples-per-thread 8 \\\n")
             f.write(f"    --devices {args.devices}\n\n")
     print(f"wrote {imaps_sh}")
     print(f"\nNext step:")
