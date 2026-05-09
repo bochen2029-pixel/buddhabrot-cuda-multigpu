@@ -204,18 +204,29 @@ __device__ __forceinline__ float2 rotate_point(float2 p, float angle) {
 }
 
 __device__ __forceinline__ int2 world_to_pixel(float2 p, const Params& P) {
-    float2 d = make_float2(p.x - P.view_center_x, p.y - P.view_center_y);
-    float2 offset = rotate_point(d, -P.rotation);
-
-    float half_w = P.view_y_span * 0.5f * P.view_aspect_ratio;
-    float half_h = P.view_y_span * 0.5f;
-
-    float norm_x = (offset.x + half_w) / (2.0f * half_w);
-    float norm_y = (offset.y + half_h) / (2.0f * half_h);
+    // Spatial binning at deep zoom (per-tile renders at 4× canonical scale or
+    // beyond) requires double-precision coordinate arithmetic. float32 has ~7
+    // decimal digits of precision near c=2.0, which gives ~350 representable
+    // floats across the width of one pixel at 4× zoom — finite, so it aliases
+    // with pixel boundaries and produces faint Moiré in heavily-converged body
+    // regions. Iteration loop stays in float for speed; only this projection
+    // step uses double. Cost: ~5 extra fp64 ops per pixel write, negligible
+    // against atomic latency.
+    double dx = (double)p.x - (double)P.view_center_x;
+    double dy = (double)p.y - (double)P.view_center_y;
+    double rot_neg = -(double)P.rotation;
+    double cos_r = cos(rot_neg);
+    double sin_r = sin(rot_neg);
+    double off_x = cos_r * dx - sin_r * dy;
+    double off_y = sin_r * dx + cos_r * dy;
+    double half_w = (double)P.view_y_span * 0.5 * (double)P.view_aspect_ratio;
+    double half_h = (double)P.view_y_span * 0.5;
+    double norm_x = (off_x + half_w) / (2.0 * half_w);
+    double norm_y = (off_y + half_h) / (2.0 * half_h);
 
     int2 px;
-    px.x = (int)floorf(norm_x * (float)P.width);
-    px.y = (int)floorf(norm_y * (float)P.height);
+    px.x = (int)floor(norm_x * (double)P.width);
+    px.y = (int)floor(norm_y * (double)P.height);
     return px;
 }
 
@@ -272,6 +283,34 @@ __device__ __forceinline__ void accumulate_orbit(
 //
 // Returns c via the output param; p(c) via *p_out.
 // -----------------------------------------------------------------------------
+// Look up IMap probability density at an arbitrary c (used by the defensive
+// uniform branch of the mixture sampler — we need p_imap(c) even when c was
+// drawn uniformly, not via the alias method).
+__device__ __forceinline__ double imap_density_at(
+    float2 c,
+    const unsigned int* __restrict__ imap_data,
+    unsigned long long total_mass,
+    unsigned int imap_resolution,
+    unsigned int n_cells,
+    float disk_cx, float disk_cy, float disk_r)
+{
+    if (total_mass == 0ULL) return 0.0;
+    float dx = c.x - disk_cx;
+    float dy = c.y - disk_cy;
+    float inv_box = 0.5f / disk_r;
+    float u = dx * inv_box + 0.5f;
+    float v = dy * inv_box + 0.5f;
+    if (u < 0.0f || u >= 1.0f || v < 0.0f || v >= 1.0f) return 0.0;
+    unsigned int cx = (unsigned int)(u * (float)imap_resolution);
+    unsigned int cy = (unsigned int)(v * (float)imap_resolution);
+    if (cx >= imap_resolution) cx = imap_resolution - 1u;
+    if (cy >= imap_resolution) cy = imap_resolution - 1u;
+    unsigned int cell_idx = cy * imap_resolution + cx;
+    double cell_area = (double)(2.0f * disk_r) * (double)(2.0f * disk_r) / (double)n_cells;
+    double cell_prob = (double)imap_data[cell_idx] / (double)total_mass;
+    return cell_prob / cell_area;
+}
+
 __device__ __forceinline__ float2 random_complex_imap(
     unsigned int* state,
     const unsigned int* __restrict__ alias_table,
@@ -349,24 +388,65 @@ __global__ void buddhabrot_kernel(
 
     float2 z0 = make_float2(P.initial_z_x, P.initial_z_y);
 
+    // Defensive IS — mix 95% IMap-sampled c with 5% uniform c. Bounds the
+    // maximum weight by ensuring p_mix(c) is never tiny (uniform contributes
+    // a floor of p_uniform = 1 / disk_area). Eliminates firefly outliers
+    // (rare orbits with absurd weights) while remaining mathematically
+    // unbiased — the weight uses the FULL mixture density regardless of
+    // which branch sampled c.
+    const float defensive_uniform_frac = 0.05f;   // 5% uniform, 95% imap
+    double disk_area = 0.0;
+    double p_uniform_density = 0.0;
+    if (is_mode) {
+        // Disk area for p_uniform = 1 / area. Uniform-on-disk uses √u radial,
+        // giving p_uniform(c) = 1 / (π * r²) for c inside the disk, 0 outside.
+        // For uniform-on-square (P.uniform_sample_distribution false), the
+        // density is 1 / (2r)² on the bounding box.
+        disk_area = (P.uniform_sample_distribution != 0)
+                  ? (3.14159265358979323846 * (double)P.sample_radius * (double)P.sample_radius)
+                  : (4.0 * (double)P.sample_radius * (double)P.sample_radius);
+        p_uniform_density = 1.0 / disk_area;
+    }
+
     for (unsigned int s = 0u; s < P.samples_per_thread; s++) {
         float2 c;
         unsigned long long weight;
         if (is_mode) {
-            double p_c;
-            c = random_complex_imap(&seed,
-                    alias_table, alias_threshold, imap_data,
-                    total_mass, imap_resolution, n_cells,
-                    P.sample_center_x, P.sample_center_y, P.sample_radius,
-                    &p_c);
-            // weight = HIST_SCALE / p(c). Round to nearest integer.
-            // p(c) is bounded below by smallest nonzero imap cell density;
-            // worst-case weight on a 1024^2 IMap with total_mass ~4e9 and a
-            // single-hit cell (mass=1, cell_area~2.4e-5) is ~10^5. uint64
-            // hist absorbs any per-pixel sum out of this.
-            double w = (double)HIST_SCALE / p_c;
-            weight = (unsigned long long)(w + 0.5);
-            if (weight == 0ULL) weight = 1ULL;
+            double p_imap_c;
+            // Defensive IS branch: 5% uniform, 95% IMap. Always use mixture
+            // density for the inverse-probability weight.
+            float u_branch = random_f32_unit(&seed);
+            if (u_branch < defensive_uniform_frac) {
+                c = random_complex_delta(&seed,
+                        P.sample_center_x, P.sample_center_y,
+                        P.sample_radius, P.uniform_sample_distribution);
+                p_imap_c = imap_density_at(c,
+                        imap_data, total_mass, imap_resolution, n_cells,
+                        P.sample_center_x, P.sample_center_y, P.sample_radius);
+            } else {
+                c = random_complex_imap(&seed,
+                        alias_table, alias_threshold, imap_data,
+                        total_mass, imap_resolution, n_cells,
+                        P.sample_center_x, P.sample_center_y, P.sample_radius,
+                        &p_imap_c);
+            }
+            // Mixture density (always — regardless of which branch sampled c).
+            double p_mix = (1.0 - (double)defensive_uniform_frac) * p_imap_c
+                         + (double)defensive_uniform_frac * p_uniform_density;
+            if (p_mix <= 0.0) continue;        // c outside disk in defensive branch
+            // weight = HIST_SCALE / p_mix. Stochastic rounding to preserve the
+            // expected value when p_mix is large enough that w < 1 (which
+            // happens at deep-zoom view-aware IS where p(c) is concentrated).
+            // Round-to-nearest with min=1 (the original code) BIASED the
+            // estimator: every w in [0, 0.5) became 1.0. Stochastic rounding
+            // preserves E[weight] = w exactly.
+            double w_real = (double)HIST_SCALE / p_mix;
+            unsigned long long w_int = (unsigned long long)w_real;
+            double w_frac = w_real - (double)w_int;
+            float u_round = random_f32_unit(&seed);
+            if ((double)u_round < w_frac) w_int += 1ULL;
+            if (w_int == 0ULL) continue;       // stochastic round dropped this sample
+            weight = w_int;
         } else {
             c = random_complex_delta(&seed,
                     P.sample_center_x, P.sample_center_y,
@@ -469,6 +549,82 @@ __global__ void imap_pass_kernel(
         unsigned int cell_idx = cy * imap_resolution + cx;
 
         atomicAdd(&imap[cell_idx], i);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// View-aware IMap pass — variant of imap_pass_kernel that weights cells by
+// VIEWPORT-HIT count rather than orbit length. For tile-pyramid renders where
+// each tile shows 1/N of the canonical c-image, the canonical orbit-length
+// IMap wastes most of its weight on c-values whose orbits don't visit THIS
+// tile. The view-aware IMap directs samples to c-values whose orbits actually
+// land in the active viewport.
+//
+// The accumulation: for each escaping c, replay the orbit from z=0 and count
+// how many of its z-points fall within the visible viewport. atomicAdd that
+// hit-count into the IMap cell containing c. The kernel uses the same
+// world_to_pixel logic as accumulate_orbit, so cells weighted by THIS
+// kernel's pre-pass match the cells whose c-values produce orbits visible in
+// the production-render's viewport.
+// -----------------------------------------------------------------------------
+__global__ void view_imap_pass_kernel(
+    unsigned int* __restrict__ imap,
+    const Params P,
+    unsigned int imap_resolution,
+    unsigned int imap_iter_cap)
+{
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    unsigned long long s64 = P.seed_64 ^ ((unsigned long long)gid * 0x9E3779B97F4A7C15ULL);
+    unsigned int seed = pcg_hash_64(s64);
+    if (seed == 0u) seed = 1u;
+
+    float2 z0 = make_float2(P.initial_z_x, P.initial_z_y);
+    float inv_box_size = 0.5f / P.sample_radius;
+
+    for (unsigned int s = 0u; s < P.samples_per_thread; s++) {
+        float2 c = random_complex_delta(&seed,
+                       P.sample_center_x, P.sample_center_y,
+                       P.sample_radius, P.uniform_sample_distribution);
+
+        // Determine cell (skip orbit work for c outside box).
+        float dx_c = c.x - P.sample_center_x;
+        float dy_c = c.y - P.sample_center_y;
+        float u_c = dx_c * inv_box_size + 0.5f;
+        float v_c = dy_c * inv_box_size + 0.5f;
+        if (u_c < 0.0f || u_c >= 1.0f || v_c < 0.0f || v_c >= 1.0f) continue;
+
+        // Replay orbit, count z-points that land in viewport.
+        unsigned int hits = 0u;
+        float2 z = z0;
+        unsigned int it = 0u;
+        bool escaped = false;
+        while (it < imap_iter_cap) {
+            z = complex_pow(z, P.exponent_x, P.exponent_y);
+            z.x += c.x; z.y += c.y;
+            it++;
+            int2 pixel = world_to_pixel(z, P);
+            if (pixel.x >= 0 && pixel.y >= 0 &&
+                pixel.x < P.width && pixel.y < P.height) {
+                hits++;
+            }
+            if (z.x * z.x + z.y * z.y > P.bailout_radius_sq) {
+                escaped = true;
+                break;
+            }
+        }
+        bool inside = !escaped;
+        bool anti   = (P.anti != 0);
+        if (inside != anti) continue;
+        if (hits == 0u) continue;
+
+        unsigned int cx = (unsigned int)(u_c * (float)imap_resolution);
+        unsigned int cy = (unsigned int)(v_c * (float)imap_resolution);
+        if (cx >= imap_resolution) cx = imap_resolution - 1u;
+        if (cy >= imap_resolution) cy = imap_resolution - 1u;
+        unsigned int cell_idx = cy * imap_resolution + cx;
+
+        atomicAdd(&imap[cell_idx], hits);
     }
 }
 
@@ -577,7 +733,13 @@ static void print_usage(const char* argv0) {
         "                           (each checkpoint writes <output>.cpNNNN.png;\n"
         "                            safe to interrupt — latest cp is usable)\n"
         "  --build-imap PATH        build importance map (Phase 1 of Bitterli IS),\n"
-        "                           save to PATH, exit. Skips render entirely.\n"
+        "                           weighted by orbit length. Run once for canonical view\n"
+        "                           and reuse via --imap.\n"
+        "  --build-view-imap PATH   build VIEW-AWARE importance map. Cells weighted by\n"
+        "                           viewport-hit count from THIS run's --view-* params,\n"
+        "                           not orbit length. Required for tile-pyramid renders\n"
+        "                           where each tile sees only 1/N of the canonical view.\n"
+        "                           Save to PATH, exit. Skips render entirely.\n"
         "  --imap-resolution N      IMap grid resolution (default 1024)\n"
         "  --imap-samples N         total uniform samples for IMap construction\n"
         "                           (default 100000000)\n"
@@ -671,6 +833,8 @@ int main(int argc, char** argv) {
     unsigned long long imap_samples = 100000000ULL;
     unsigned int imap_iter_cap = 2000;
     std::string imap_heatmap_path;
+    int build_view_aware_imap = 0;     // 0 = orbit-length weighting (Bitterli §B7),
+                                        // 1 = viewport-hit weighting (per-tile renders)
 
     // Phase 2/3/4 (Bitterli IS sampling + min-escape) flags.
     std::string imap_path;                  // empty = uniform sampling
@@ -726,6 +890,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--launches-per-round")) launches_per_round = atoi(need(a));
         else if (!strcmp(a, "--checkpoint-every"))   checkpoint_every_rounds = atoi(need(a));
         else if (!strcmp(a, "--build-imap"))         build_imap_path = need(a);
+        else if (!strcmp(a, "--build-view-imap"))    { build_imap_path = need(a); build_view_aware_imap = 1; }
         else if (!strcmp(a, "--imap-resolution"))    imap_resolution = (unsigned)atoi(need(a));
         else if (!strcmp(a, "--imap-samples"))       imap_samples = strtoull(need(a), nullptr, 10);
         else if (!strcmp(a, "--imap-iter-cap"))      imap_iter_cap = (unsigned)atoi(need(a));
@@ -848,8 +1013,13 @@ int main(int argc, char** argv) {
             local_P.seed_64 = base_seed
                             ^ (L * 0x9E3779B97F4A7C15ULL)
                             ^ 0x12345678ABCDEF01ULL;
-            imap_pass_kernel<<<blocks_per_launch, threads_per_block, 0, stream_imap>>>(
-                d_imap, local_P, imap_resolution, imap_iter_cap);
+            if (build_view_aware_imap) {
+                view_imap_pass_kernel<<<blocks_per_launch, threads_per_block, 0, stream_imap>>>(
+                    d_imap, local_P, imap_resolution, imap_iter_cap);
+            } else {
+                imap_pass_kernel<<<blocks_per_launch, threads_per_block, 0, stream_imap>>>(
+                    d_imap, local_P, imap_resolution, imap_iter_cap);
+            }
         }
         check(cudaStreamSynchronize(stream_imap), "stream sync imap");
         double t_compute_imap = now_seconds() - t_start_imap;
