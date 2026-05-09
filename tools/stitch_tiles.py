@@ -48,6 +48,9 @@ def main():
     ap.add_argument("--gamma", type=float, default=4.0)
     ap.add_argument("--norm-floor", type=float, default=15.0)
     ap.add_argument("--max-percentile", type=float, default=99.99)
+    ap.add_argument("--keep-apron", action="store_true",
+                    help="emit TIFFs at apron-extended dimensions (no trim). "
+                         "Required for compose_blended.py crossfade.")
     args = ap.parse_args()
 
     tile_dir = Path(args.tile_dir)
@@ -140,17 +143,23 @@ def main():
             out16[y0:y1, :, 1] = np.clip(g, 0, 65535).astype(np.uint16)
             out16[y0:y1, :, 2] = np.clip(b, 0, 65535).astype(np.uint16)
 
-        # Trim apron — keep only the central native_width × native_height region.
-        apron = t["apron"]
-        nw, nh = t["native_width"], t["native_height"]
-        # Apron-extended dims should be (nw + 2*apron, nh + 2*apron)
-        trimmed = out16[apron:apron+nh, apron:apron+nw, :]
-        tifffile.imwrite(out_tiff, trimmed, photometric="rgb")
-        print(f"  wrote {out_tiff} ({trimmed.shape[1]}x{trimmed.shape[0]})")
+        if args.keep_apron:
+            # Emit full apron-extended tile. compose_blended.py will trim+blend.
+            tifffile.imwrite(out_tiff, out16, photometric="rgb")
+            print(f"  wrote {out_tiff} ({out16.shape[1]}x{out16.shape[0]}) [apron retained]")
+        else:
+            # Trim apron — keep only the central native_width × native_height region.
+            apron = t["apron"]
+            nw, nh = t["native_width"], t["native_height"]
+            trimmed = out16[apron:apron+nh, apron:apron+nw, :]
+            tifffile.imwrite(out_tiff, trimmed, photometric="rgb")
+            print(f"  wrote {out_tiff} ({trimmed.shape[1]}x{trimmed.shape[0]})")
 
     # Save stitch metadata for the pyramid packer.
     stitch_meta = {
         "grid": spec["grid"],
+        "apron":          spec.get("apron", 0),
+        "keep_apron":     bool(args.keep_apron),
         "per_tile_width":  spec["per_tile_width"],
         "per_tile_height": spec["per_tile_height"],
         "tiles": [
