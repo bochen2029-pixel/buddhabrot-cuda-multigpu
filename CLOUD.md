@@ -21,11 +21,13 @@ ssh -i ~/.ssh/hyperbolic_key ubuntu@<instance-ip>
 
 On the Hyperbolic instance:
 ```
-curl -sSL https://raw.githubusercontent.com/bochen2029-pixel/buddhabrot-cuda-multigpu/master/bootstrap-hyperbolic.sh | bash
+curl -sSL "https://raw.githubusercontent.com/bochen2029-pixel/buddhabrot-cuda-multigpu/master/bootstrap-hyperbolic.sh?ts=$(date +%s)" | bash
 cd ~/buddhabrot-cuda-multigpu
 export HF_TOKEN=hf_...           # for background checkpoint sync
 ./run-cloud-hyperbolic.sh
 ```
+
+The `?ts=$(date +%s)` is a cache-bust: GitHub Raw URLs are fronted by Fastly with 5-min per-edge TTL; within 5 min of a push, edge nodes may serve the previous version. Timestamp query string is part of Fastly's cache key but ignored by GitHub. Omit if you know the bootstrap hasn't changed in the last 10 min.
 
 That's it. Bootstrap takes ~2 min (build + IMap). Render takes 80 min. Watchdog enforces 90-min hard cap. Each checkpoint .bin (~19 GB) syncs to your HuggingFace bucket in the background.
 

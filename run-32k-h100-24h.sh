@@ -113,28 +113,77 @@ if [ ! -f imap.bin ]; then
     ./build_imap.sh
 fi
 
-# Pick session manager: screen > tmux > nohup. Hyperbolic's stock image
-# usually has tmux preinstalled even without screen; use that as fallback
-# before resorting to nohup.
+# Pick session manager via PROBE (not just presence check). Each candidate
+# is tested by starting a 60-sec dummy session and verifying it actually
+# stuck — `command -v` says nothing about whether the binary works in this
+# environment. K0 lesson §2.12: screen breaks on Hyperbolic's stock image
+# with [screen is terminating] due to /var/run/screen perms.
+#
+# Order: tmux first (works everywhere per K0 + our own experience), then
+# screen (with SCREENDIR=~/.screen workaround if the default dir is broken),
+# then apt-install tmux if privileged, finally nohup.
+#
+# Failproof: if any probe fails, fall through to the next; the prior
+# linear-preference behavior (screen > tmux > nohup) is recoverable by
+# `git revert` on this commit if the new logic causes trouble.
+PROBE_ID="_probe_$$"
 SESSION_TOOL=""
-if command -v screen >/dev/null; then
-    SESSION_TOOL="screen"
-elif command -v tmux >/dev/null; then
-    SESSION_TOOL="tmux"
-else
-    # Try installing screen if we have privilege
-    if [ -n "$APT_PREFIX" ] || [ "$PRIVILEGE" = "root" ]; then
-        echo "[deps] installing screen (${APT_PREFIX}apt-get)..."
-        if ${APT_PREFIX}apt-get update -qq && ${APT_PREFIX}apt-get install -y -qq screen; then
+
+if command -v tmux >/dev/null; then
+    if tmux new-session -d -s "$PROBE_ID" "sleep 60" 2>/dev/null; then
+        sleep 0.3
+        if tmux has-session -t "$PROBE_ID" 2>/dev/null; then
+            tmux kill-session -t "$PROBE_ID" 2>/dev/null
+            SESSION_TOOL="tmux"
+            echo "[deps] tmux probe: PASS"
+        else
+            echo "[deps] tmux probe: started but vanished — trying screen"
+        fi
+    else
+        echo "[deps] tmux probe: failed to start — trying screen"
+    fi
+fi
+
+if [ -z "$SESSION_TOOL" ] && command -v screen >/dev/null; then
+    if screen -dmS "$PROBE_ID" sleep 60 2>/dev/null && sleep 0.3 && screen -ls 2>/dev/null | grep -q "$PROBE_ID"; then
+        screen -S "$PROBE_ID" -X quit 2>/dev/null
+        SESSION_TOOL="screen"
+        echo "[deps] screen probe: PASS"
+    else
+        # K0 §2.12 workaround: stock /var/run/screen perms can be wrong;
+        # try a private SCREENDIR.
+        mkdir -p "$HOME/.screen" && chmod 700 "$HOME/.screen"
+        export SCREENDIR="$HOME/.screen"
+        if screen -dmS "$PROBE_ID" sleep 60 2>/dev/null && sleep 0.3 && screen -ls 2>/dev/null | grep -q "$PROBE_ID"; then
+            screen -S "$PROBE_ID" -X quit 2>/dev/null
             SESSION_TOOL="screen"
+            echo "[deps] screen probe (SCREENDIR=\$HOME/.screen workaround): PASS"
+        else
+            unset SCREENDIR
+            echo "[deps] screen probe: FAIL (even with SCREENDIR workaround)"
         fi
     fi
-    if [ -z "$SESSION_TOOL" ]; then
-        echo "[deps] WARN: no screen, no tmux, no apt privilege."
-        echo "       Render will run via nohup — survives SSH disconnect but no"
-        echo "       interactive reattach. Output goes to nohup_render.log."
-        SESSION_TOOL="nohup"
+fi
+
+if [ -z "$SESSION_TOOL" ] && { [ -n "$APT_PREFIX" ] || [ "$PRIVILEGE" = "root" ]; }; then
+    echo "[deps] no working session manager; installing tmux via ${APT_PREFIX:-}apt-get..."
+    if ${APT_PREFIX}apt-get update -qq && ${APT_PREFIX}apt-get install -y -qq tmux; then
+        if tmux new-session -d -s "$PROBE_ID" "sleep 60" 2>/dev/null; then
+            sleep 0.3
+            if tmux has-session -t "$PROBE_ID" 2>/dev/null; then
+                tmux kill-session -t "$PROBE_ID" 2>/dev/null
+                SESSION_TOOL="tmux"
+                echo "[deps] post-install tmux probe: PASS"
+            fi
+        fi
     fi
+fi
+
+if [ -z "$SESSION_TOOL" ]; then
+    echo "[deps] WARN: no working tmux/screen and no apt privilege."
+    echo "       Render will run via nohup — survives SSH disconnect but no"
+    echo "       interactive reattach. Output goes to nohup_render.log."
+    SESSION_TOOL="nohup"
 fi
 echo "[deps] session manager: $SESSION_TOOL"
 
@@ -307,6 +356,12 @@ echo
 echo "  # Quick health check:"
 echo "  nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw --format=csv"
 echo "  ls -lh $OUTPUT_BASE*.bin 2>/dev/null"
+echo
+echo "  # IMPORTANT — terminal silence DOES NOT mean the render is stalled."
+echo "  # The supervise wrapper redirects render stdout/stderr to log files."
+echo "  # Source of truth = nvidia-smi GPU utilization. If util > 50%, alive."
+echo "  # If terminal silent BUT nvidia-smi shows util, render is fine — do"
+echo "  # NOT Ctrl-C. Tail the log file in a separate SSH tab instead."
 echo
 if [ "$PRIVILEGE" = "root" ] || [ -n "$APT_PREFIX" ]; then
     echo "  # Linux-level shutdown safety net (recommended): 24 hr from now"

@@ -17,11 +17,13 @@
 **One-line answer:** SSH into Hyperbolic instance, paste this, walk away:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/bochen2029-pixel/buddhabrot-cuda-multigpu/master/bootstrap-hyperbolic.sh | bash && \
+curl -sSL "https://raw.githubusercontent.com/bochen2029-pixel/buddhabrot-cuda-multigpu/master/bootstrap-hyperbolic.sh?ts=$(date +%s)" | bash && \
 cd ~/buddhabrot-cuda-multigpu && \
 export HF_TOKEN=<YOUR_HF_TOKEN> && \
 ./run-cloud-hyperbolic.sh
 ```
+
+The `?ts=$(date +%s)` defeats Fastly's 5-min per-edge cache on GitHub Raw (K0 lesson §2.7).
 
 **End state:** Final `buddhabrot_cloud_32k_2T.png` (~3.4 GB) + `.bin` (~19.3 GB) + 3 intermediate checkpoint pairs uploaded to your HuggingFace bucket `bochen2079/buddhabrot`.
 
@@ -217,8 +219,10 @@ screen -S buddha
 ### 4.1 Run the one-shot bootstrap
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/bochen2029-pixel/buddhabrot-cuda-multigpu/master/bootstrap-hyperbolic.sh | bash
+curl -sSL "https://raw.githubusercontent.com/bochen2029-pixel/buddhabrot-cuda-multigpu/master/bootstrap-hyperbolic.sh?ts=$(date +%s)" | bash
 ```
+
+(Cache-bust query parameter forces Fastly origin fetch; see K0 lesson §2.7.)
 
 This script:
 1. Verifies CUDA toolkit (errors if missing)

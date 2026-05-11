@@ -2,7 +2,13 @@
 # One-shot bootstrap for a fresh Hyperbolic.xyz instance.
 #
 # Usage on the cloud instance (after ssh in):
-#   curl -sSL https://raw.githubusercontent.com/bochen2079/buddhabrot-cuda/main/cuda-render-16k/bootstrap-hyperbolic.sh | bash
+#   curl -sSL "https://raw.githubusercontent.com/bochen2079/buddhabrot-cuda/main/cuda-render-16k/bootstrap-hyperbolic.sh?ts=$(date +%s)" | bash
+#
+# The "?ts=$(date +%s)" suffix is a cache-bust: GitHub Raw URLs are fronted
+# by Fastly with 5-min per-edge TTL. Within 5 min of a push, edges may
+# serve the previous version (K0 lesson §2.7). The timestamp query string
+# is part of Fastly's cache key but ignored by GitHub, forcing an origin
+# fetch. Safe to omit if you know the bootstrap hasn't changed recently.
 #
 # Or if you've already cloned the repo:
 #   cd buddhabrot-cuda/cuda-render-16k && ./bootstrap-hyperbolic.sh
@@ -74,10 +80,27 @@ echo "[3/7] Cloning repo..."
 if [ -d "$REPO_DIR/.git" ]; then
     echo "Repo already exists at $REPO_DIR; pulling latest"
     cd "$REPO_DIR"
-    git pull --ff-only
+    # K0 §2.8: chmod (run later in step 6) marks files as modified under
+    # core.filemode=true (Linux default). Next `git pull --ff-only` then
+    # refuses to merge. Set filemode=false BEFORE pulling so the pull
+    # tolerates any prior chmod-dirty state. `|| true` ensures that if
+    # `git config` itself fails for any reason, we proceed with the
+    # original behavior — worst case is the same `local changes would be
+    # overwritten` error you'd hit without this guard.
+    git config core.filemode false 2>/dev/null || true
+    # Defensive: if a prior chmod already dirtied the tree, attempt the
+    # ff-only pull, then fall back to fetch+reset if it fails. Pod is
+    # rented hardware — no local state to preserve.
+    if ! git pull --ff-only 2>&1; then
+        echo "[3/7] ff-only pull failed (likely stale chmod state); hard-resetting..."
+        git fetch origin && git reset --hard origin/HEAD 2>/dev/null || \
+            git reset --hard origin/master 2>/dev/null || \
+            git reset --hard origin/main
+    fi
 else
     git clone "$REPO_URL" "$REPO_DIR"
     cd "$REPO_DIR"
+    git config core.filemode false 2>/dev/null || true
 fi
 if [ -n "$SUBDIR" ] && [ -d "$SUBDIR" ]; then
     cd "$SUBDIR"
@@ -86,13 +109,29 @@ echo "[3/7] In: $(pwd)"
 
 # 4. Install Python deps for HF sync (background).
 # pip flag varies by privilege: root installs system-wide, non-root needs --user.
+# K0 §2.4: Ubuntu 22.04+ marks system Python externally-managed (PEP 668);
+# pip refuses to install without --break-system-packages. Probe whether pip
+# supports the flag (pip 23.0+) and add it conditionally. If install fails
+# WITH the flag, fall back to plain --user (original behavior). Triple-
+# fallback chain ends at the pre-K0-advice install command, so we can't be
+# worse off than before this hardening.
 echo
 echo "[4/7] Installing huggingface_hub (Python, pip $PIP_USER_FLAG)..."
+BREAK_FLAG=""
+if pip3 install --help 2>/dev/null | grep -q -- '--break-system-packages'; then
+    BREAK_FLAG="--break-system-packages"
+elif python3 -m pip install --help 2>/dev/null | grep -q -- '--break-system-packages'; then
+    BREAK_FLAG="--break-system-packages"
+fi
+[ -n "$BREAK_FLAG" ] && echo "  pip supports --break-system-packages; using it (PEP 668 defense)"
 if command -v pip3 >/dev/null; then
-    pip3 install -q -U $PIP_USER_FLAG huggingface_hub || \
-        python3 -m pip install -q -U $PIP_USER_FLAG huggingface_hub
+    pip3 install -q -U $PIP_USER_FLAG $BREAK_FLAG huggingface_hub \
+        || python3 -m pip install -q -U $PIP_USER_FLAG $BREAK_FLAG huggingface_hub \
+        || pip3 install -q -U $PIP_USER_FLAG huggingface_hub \
+        || python3 -m pip install -q -U $PIP_USER_FLAG huggingface_hub
 else
-    python3 -m pip install -q -U $PIP_USER_FLAG huggingface_hub
+    python3 -m pip install -q -U $PIP_USER_FLAG $BREAK_FLAG huggingface_hub \
+        || python3 -m pip install -q -U $PIP_USER_FLAG huggingface_hub
 fi
 # When pip installs with --user, ~/.local/bin may not be in PATH yet.
 if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
