@@ -155,7 +155,11 @@ export TARGET_SAMPLES="${TARGET_SAMPLES:-2000000000000}"   # 2 T ambitious
 export TRIM_R="${TRIM_R:-0.95}"
 export TRIM_G="${TRIM_G:-0.66}"
 export TRIM_B="${TRIM_B:-0.38}"
-export CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-540}"          # ~1 cp/hr at 12 M/s
+export CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-320}"          # first cp at ~30 min (12 M/s)
+# Cadence math: 1 round ≈ 5.6s at 12 M/s → 320 rounds ≈ 30 min between cps.
+# Expected total cps over 24h: ~45. Save overhead: ~3 hr (13% of 24h).
+# Override to 540 for hourly cps + lower overhead (~8%) at the cost of
+# first-cp landing at T+50min instead of T+30min.
 export LAUNCHES_PER_ROUND="${LAUNCHES_PER_ROUND:-8}"
 export SAMPLES_PER_THREAD="${SAMPLES_PER_THREAD:-8}"        # TDR-safe
 export WALLCLOCK_HARD_CAP="${WALLCLOCK_HARD_CAP:-82800}"    # 23 hr
@@ -164,7 +168,12 @@ export OUTPUT_BASE="${OUTPUT_BASE:-buddhabrot_cloud_32k_h100_24h}"
 
 echo
 echo "[config] resolution: ${WIDTH}x${HEIGHT}  target: ${TARGET_SAMPLES} samples"
-echo "[config] cp every:   ${CHECKPOINT_EVERY} rounds  (~1 hr at 12 M/s)"
+# Per-round time: 1 round = launches_per_round × 4096 × 256 × samples_per_thread samples
+#                          / throughput.  At LPR=8 SPT=8: per_round = 67.1M / throughput.
+# At 12 M/s: 5.59 sec/round → CHECKPOINT_EVERY × 5.59 / 60 = CHECKPOINT_EVERY × 559 / 6000 min
+# At 25 M/s: 2.68 sec/round → CHECKPOINT_EVERY × 268 / 6000 min
+echo "[config] cp every:   ${CHECKPOINT_EVERY} rounds  (~$((CHECKPOINT_EVERY * 559 / 6000)) min at 12 M/s, ~$((CHECKPOINT_EVERY * 268 / 6000)) min at 25 M/s)"
+echo "[config] first cp:   expected at T+$((CHECKPOINT_EVERY * 559 / 6000)) min (watch HF bucket then)"
 echo "[config] cap:        ${WALLCLOCK_HARD_CAP}s = $((WALLCLOCK_HARD_CAP/3600)) hr"
 echo "[config] SIGUSR1 at: T+$((WALLCLOCK_HARD_CAP - SIGUSR1_LEAD))s ($(((WALLCLOCK_HARD_CAP - SIGUSR1_LEAD)/3600)) hr $((((WALLCLOCK_HARD_CAP - SIGUSR1_LEAD)%3600)/60)) min)"
 echo "[config] trims:      R=$TRIM_R G=$TRIM_G B=$TRIM_B (predicted for 1.5T density)"
