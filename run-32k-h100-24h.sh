@@ -78,6 +78,85 @@ if [ "$GPU_MEM" -lt 25000 ]; then
     exit 1
 fi
 
+# -------------------------------------------------------------------------
+# VRAM-used pre-flight (pod-reuse defense)
+# -------------------------------------------------------------------------
+# If you reused this pod from a prior session (K0 fine-tune, etc.), the
+# Python process from that workload may still be alive and holding model
+# weights cached in PyTorch's allocator. PyTorch releases VRAM only on
+# process exit — NOT on model.cpu()/del/gc.collect(). Result: nvidia-smi
+# shows tens of GB held even though "training is done."
+#
+# Logic:
+#   - GPU_MEM_AVAIL < 25 GB → ERROR with BIG WORDS + kill recipe + exit 1
+#     (render would OOM at first kernel launch — better to fail here)
+#   - GPU_MEM_USED > 1 GB  → WARN with kill recipe but continue
+#     (driver baseline ~500 MB; >1 GB means something is actively holding)
+#
+# Failproof: if `nvidia-smi --query-gpu=memory.used` returns non-numeric
+# for any reason (unusual driver, container quirk), we skip the check
+# rather than block the launch. Pre-K0-advice behavior was no check at
+# all, so skipping is no worse than that.
+GPU_MEM_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+if [[ "$GPU_MEM_USED" =~ ^[0-9]+$ ]]; then
+    GPU_MEM_AVAIL=$((GPU_MEM - GPU_MEM_USED))
+    echo "[gpu] VRAM: ${GPU_MEM_USED} MiB used / ${GPU_MEM} MiB total → ${GPU_MEM_AVAIL} MiB available"
+    if [ "$GPU_MEM_AVAIL" -lt 25000 ]; then
+        echo
+        echo "############################################################"
+        echo "##                                                        ##"
+        echo "##     !!!  NOT ENOUGH FREE VRAM TO LAUNCH  !!!           ##"
+        echo "##                                                        ##"
+        echo "############################################################"
+        echo
+        echo "  Required: ~25 GB available (24 GB histogram + ~1 GB working)"
+        echo "  Have:     ${GPU_MEM_AVAIL} MiB available out of ${GPU_MEM} MiB total"
+        echo "  In use:   ${GPU_MEM_USED} MiB held by another process"
+        echo
+        echo "  Likely cause: a Python process from a prior session (e.g. K0"
+        echo "  fine-tune) is still alive and holding weights in PyTorch's"
+        echo "  GPU allocator. Python releases VRAM only on process exit."
+        echo
+        echo "  ## See what's holding VRAM:"
+        echo "    nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv"
+        echo
+        echo "  ## Nuke all Python (K0 weights are already saved to disk/HF):"
+        echo "    pkill -9 -f python3 ; sleep 2 ; pkill -9 -f python ; sleep 2"
+        echo
+        echo "  ## If a tmux session is running it, kill the session too:"
+        echo "    tmux ls 2>/dev/null"
+        echo "    tmux kill-session -t <session-name>"
+        echo
+        echo "  ## Re-verify VRAM is free (< 1 GB used is clean):"
+        echo "    nvidia-smi --query-gpu=memory.used --format=csv,noheader"
+        echo
+        echo "  ## Then re-run this script."
+        echo
+        echo "  --- Current compute apps holding VRAM: ---"
+        nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>/dev/null || true
+        echo
+        exit 1
+    elif [ "$GPU_MEM_USED" -gt 1000 ]; then
+        echo
+        echo "############################################################"
+        echo "## WARN: ${GPU_MEM_USED} MiB VRAM held by another process     "
+        echo "############################################################"
+        echo "  ${GPU_MEM_AVAIL} MiB available is plenty for our render,"
+        echo "  but if you intended this pod to be clean (e.g. after K0"
+        echo "  fine-tune), kill the stale Python first:"
+        echo "    pkill -9 -f python3 ; sleep 2"
+        echo
+        echo "  Compute apps currently holding VRAM:"
+        nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv 2>/dev/null | sed 's/^/    /'
+        echo
+        echo "  Continuing in 10 seconds. Ctrl-C now to abort and clean up."
+        sleep 10
+    fi
+else
+    echo "[gpu] WARN: could not parse nvidia-smi memory.used — skipping VRAM pre-flight."
+    echo "       Manually verify: nvidia-smi --query-gpu=memory.used --format=csv"
+fi
+
 # Driver-version pre-flight. Hyperbolic ships driver 535.x which limits the
 # CUDA runtime to 12.2. For our buddhabrot binary that's fine (sm_90 H100
 # only needs CUDA 12.0+), but if you also want to compile/run sm_120
