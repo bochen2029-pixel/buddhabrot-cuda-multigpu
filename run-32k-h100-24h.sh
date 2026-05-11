@@ -66,7 +66,9 @@ fi
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
 GPU_COUNT=$(nvidia-smi -L | wc -l)
-echo "[gpu] $GPU_NAME — $GPU_MEM MiB — $GPU_COUNT GPU(s) detected"
+DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+DRIVER_MAJOR=$(echo "$DRIVER_VER" | cut -d. -f1)
+echo "[gpu] $GPU_NAME — $GPU_MEM MiB — $GPU_COUNT GPU(s) — driver $DRIVER_VER"
 case "$GPU_NAME" in
     *H100*|*H200*|*B200*) echo "[gpu] datacenter-class; good" ;;
     *) echo "[gpu] WARN: GPU not H100/H200/B200 class. 32K histogram needs ~24 GB VRAM." ;;
@@ -74,6 +76,29 @@ esac
 if [ "$GPU_MEM" -lt 25000 ]; then
     echo "ERROR: GPU has < 25 GB VRAM. 32K histogram needs 19.3 GB + ~4 GB working = ~24 GB."
     exit 1
+fi
+
+# Driver-version pre-flight. Hyperbolic ships driver 535.x which limits the
+# CUDA runtime to 12.2. For our buddhabrot binary that's fine (sm_90 H100
+# only needs CUDA 12.0+), but if you also want to compile/run sm_120
+# (Blackwell / 5090), you'd need driver 550+ which requires apt-upgrade +
+# reboot. Pure-CUDA pipeline (no torch), so we don't need 12.4+ for the
+# Python stack — but document the constraint either way.
+if [ "$DRIVER_MAJOR" -lt 550 ]; then
+    echo "[driver] WARN: driver $DRIVER_VER < 550. OK for H100/H200 but NOT for 5090/sm_120."
+    echo "         If you ever want to use Blackwell, upgrade: sudo apt-get install nvidia-driver-570"
+    echo "         (Reboot kills your SSH session — reconnect after 1-3 min. Render starts AFTER upgrade.)"
+elif [ "$DRIVER_MAJOR" -lt 535 ]; then
+    echo "ERROR: driver $DRIVER_VER is ancient. Upgrade before running:"
+    echo "       sudo apt-get update && sudo apt-get install -y nvidia-driver-570 && sudo reboot"
+    exit 1
+fi
+
+# CUDA toolkit version (used by build.sh). H100 needs CUDA 12.0+, fine on
+# Hyperbolic's 12.2. Builder script will auto-skip sm_120 if nvcc < 12.6.
+if command -v nvcc >/dev/null; then
+    NVCC_VER=$(nvcc --version | grep -oE 'release [0-9]+\.[0-9]+' | head -1)
+    echo "[cuda] $NVCC_VER (used for build; sm_120 auto-skipped if < 12.6)"
 fi
 
 # Build buddhabrot if missing
@@ -88,24 +113,30 @@ if [ ! -f imap.bin ]; then
     ./build_imap.sh
 fi
 
-# Install screen if missing. Use privilege-appropriate command.
-if ! command -v screen >/dev/null; then
-    if [ -z "$APT_PREFIX" ] && [ "$PRIVILEGE" != "root" ]; then
-        echo "[deps] WARN: 'screen' missing and no apt privilege. Render will run in"
-        echo "       foreground; SSH disconnect will kill it. Alternatives:"
-        echo "         (a) ask pod admin to install screen, OR"
-        echo "         (b) use 'tmux' if it's preinstalled, OR"
-        echo "         (c) use 'nohup ./run-cloud-hyperbolic.sh &' instead of this wrapper"
-        echo "       Continuing without screen — render will be foreground."
-        USE_SCREEN=0
-    else
-        echo "[deps] installing screen (${APT_PREFIX}apt-get)..."
-        ${APT_PREFIX}apt-get update -qq && ${APT_PREFIX}apt-get install -y -qq screen
-        USE_SCREEN=1
-    fi
+# Pick session manager: screen > tmux > nohup. Hyperbolic's stock image
+# usually has tmux preinstalled even without screen; use that as fallback
+# before resorting to nohup.
+SESSION_TOOL=""
+if command -v screen >/dev/null; then
+    SESSION_TOOL="screen"
+elif command -v tmux >/dev/null; then
+    SESSION_TOOL="tmux"
 else
-    USE_SCREEN=1
+    # Try installing screen if we have privilege
+    if [ -n "$APT_PREFIX" ] || [ "$PRIVILEGE" = "root" ]; then
+        echo "[deps] installing screen (${APT_PREFIX}apt-get)..."
+        if ${APT_PREFIX}apt-get update -qq && ${APT_PREFIX}apt-get install -y -qq screen; then
+            SESSION_TOOL="screen"
+        fi
+    fi
+    if [ -z "$SESSION_TOOL" ]; then
+        echo "[deps] WARN: no screen, no tmux, no apt privilege."
+        echo "       Render will run via nohup — survives SSH disconnect but no"
+        echo "       interactive reattach. Output goes to nohup_render.log."
+        SESSION_TOOL="nohup"
+    fi
 fi
+echo "[deps] session manager: $SESSION_TOOL"
 
 # HF auth (only if env set)
 HF_SYNC_ENABLED=0
@@ -179,54 +210,13 @@ echo "[config] SIGUSR1 at: T+$((WALLCLOCK_HARD_CAP - SIGUSR1_LEAD))s ($(((WALLCL
 echo "[config] trims:      R=$TRIM_R G=$TRIM_G B=$TRIM_B (predicted for 1.5T density)"
 
 # -------------------------------------------------------------------------
-# Launch — prefer detached screen so it survives SSH disconnects; fall back
-# to nohup-in-background if screen unavailable.
+# Launch — detached session via screen | tmux | nohup. All three survive
+# SSH disconnect; screen/tmux additionally allow interactive reattach.
 # -------------------------------------------------------------------------
 SESSION="h100_32k"
 
-if [ "${USE_SCREEN:-1}" = "1" ]; then
-    # Kill any prior session with this name
-    screen -S "$SESSION" -X quit 2>/dev/null || true
-    sleep 1
-
-    LAUNCH_CMD="\
-export N_DEVICES=$N_DEVICES; \
-export WIDTH=$WIDTH; \
-export HEIGHT=$HEIGHT; \
-export TARGET_SAMPLES=$TARGET_SAMPLES; \
-export TRIM_R=$TRIM_R; \
-export TRIM_G=$TRIM_G; \
-export TRIM_B=$TRIM_B; \
-export CHECKPOINT_EVERY=$CHECKPOINT_EVERY; \
-export LAUNCHES_PER_ROUND=$LAUNCHES_PER_ROUND; \
-export SAMPLES_PER_THREAD=$SAMPLES_PER_THREAD; \
-export WALLCLOCK_HARD_CAP=$WALLCLOCK_HARD_CAP; \
-export SIGUSR1_LEAD=$SIGUSR1_LEAD; \
-export OUTPUT_BASE=$OUTPUT_BASE; \
-export HF_BUCKET=$HF_BUCKET; \
-export HF_SYNC_ENABLED=$HF_SYNC_ENABLED; \
-./run-cloud-hyperbolic.sh; \
-echo 'Render exited at '\$(date -u); \
-exec bash"
-
-    screen -dmS "$SESSION" bash -c "$LAUNCH_CMD"
-    sleep 2
-
-    if screen -ls | grep -q "$SESSION"; then
-        echo
-        echo "[launch] render running in screen session '$SESSION'"
-        echo "[launch] PID: $(screen -ls | grep "$SESSION" | awk '{print $1}' | cut -d. -f1)"
-    else
-        echo "ERROR: screen session failed to start"
-        exit 1
-    fi
-else
-    # nohup fallback — render survives SSH disconnect via SIGHUP ignore,
-    # but no interactive reattach. Output goes to nohup.out + stderr.log.
-    echo
-    echo "[launch] starting render via nohup (no screen available)"
-    nohup bash -c "\
-export N_DEVICES=$N_DEVICES \
+# Build the launch command shared across all three paths
+LAUNCH_INNER="export N_DEVICES=$N_DEVICES \
        WIDTH=$WIDTH HEIGHT=$HEIGHT \
        TARGET_SAMPLES=$TARGET_SAMPLES \
        TRIM_R=$TRIM_R TRIM_G=$TRIM_G TRIM_B=$TRIM_B \
@@ -238,7 +228,41 @@ export N_DEVICES=$N_DEVICES \
        OUTPUT_BASE=$OUTPUT_BASE \
        HF_BUCKET=$HF_BUCKET \
        HF_SYNC_ENABLED=$HF_SYNC_ENABLED; \
-./run-cloud-hyperbolic.sh" > nohup_render.log 2>&1 &
+./run-cloud-hyperbolic.sh; \
+echo 'Render exited at '\$(date -u)"
+
+if [ "$SESSION_TOOL" = "screen" ]; then
+    screen -S "$SESSION" -X quit 2>/dev/null || true
+    sleep 1
+    screen -dmS "$SESSION" bash -c "$LAUNCH_INNER; exec bash"
+    sleep 2
+    if screen -ls | grep -q "$SESSION"; then
+        echo
+        echo "[launch] render running in screen session '$SESSION'"
+        echo "[launch] reattach: screen -r $SESSION  (Ctrl-A D to detach)"
+    else
+        echo "ERROR: screen session failed to start"
+        exit 1
+    fi
+elif [ "$SESSION_TOOL" = "tmux" ]; then
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    sleep 1
+    tmux new-session -d -s "$SESSION" bash -c "$LAUNCH_INNER; exec bash"
+    sleep 2
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo
+        echo "[launch] render running in tmux session '$SESSION'"
+        echo "[launch] reattach: tmux attach -t $SESSION  (Ctrl-B D to detach)"
+    else
+        echo "ERROR: tmux session failed to start"
+        exit 1
+    fi
+else
+    # nohup fallback — render survives SSH disconnect via SIGHUP ignore,
+    # but no interactive reattach. Output goes to nohup_render.log.
+    echo
+    echo "[launch] starting render via nohup (no screen/tmux available)"
+    nohup bash -c "$LAUNCH_INNER" > nohup_render.log 2>&1 &
     RENDER_BG_PID=$!
     disown
     echo "[launch] render running in background, PID $RENDER_BG_PID  log: nohup_render.log"
@@ -252,21 +276,30 @@ echo "============================================================"
 echo "Render is going. Useful commands:"
 echo "============================================================"
 echo
-if [ "${USE_SCREEN:-1}" = "1" ]; then
-    echo "  # Attach to the running screen (Ctrl-A D to detach without killing):"
-    echo "  screen -r $SESSION"
-    echo
-    echo "  # Manually kill the render (rare):"
-    echo "  screen -S $SESSION -X stuff \$'\\003'"
-else
-    echo "  # Render in background (no screen). Tail nohup output:"
-    echo "  tail -f nohup_render.log"
-    echo
-    echo "  # Render PID: ${RENDER_BG_PID:-(check via pgrep buddhabrot)}"
-    echo "  # Manually kill the render (rare):"
-    echo "  kill -USR1 \$(cat $OUTPUT_BASE.pid 2>/dev/null) 2>/dev/null  # graceful save+exit"
-    echo "  # or: pkill -USR1 buddhabrot"
-fi
+case "$SESSION_TOOL" in
+    screen)
+        echo "  # Reattach to render (Ctrl-A D to detach without killing):"
+        echo "  screen -r $SESSION"
+        echo
+        echo "  # Manually kill the render (rare):"
+        echo "  screen -S $SESSION -X stuff \$'\\003'"
+        ;;
+    tmux)
+        echo "  # Reattach to render (Ctrl-B D to detach without killing):"
+        echo "  tmux attach -t $SESSION"
+        echo
+        echo "  # Manually kill the render (rare):"
+        echo "  tmux send-keys -t $SESSION C-c"
+        ;;
+    nohup)
+        echo "  # Render in background. Tail nohup output:"
+        echo "  tail -f nohup_render.log"
+        echo
+        echo "  # Render PID: ${RENDER_BG_PID:-(check via pgrep buddhabrot)}"
+        echo "  # Graceful save+exit (waits for round to finish):"
+        echo "  pkill -USR1 buddhabrot"
+        ;;
+esac
 echo
 echo "  # Tail the renderer stderr log:"
 echo "  tail -f $OUTPUT_BASE.stderr.log"
