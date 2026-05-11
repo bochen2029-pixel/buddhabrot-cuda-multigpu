@@ -24,6 +24,30 @@ echo "============================================================"
 echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Host: $(hostname)"
 echo "User: $(whoami)"
+
+# Privilege detection. RunPod gives root by default; Hyperbolic/Lambda/Vast
+# typically give an unprivileged user (often `ubuntu`) with passwordless sudo
+# but no direct root. Cloud-init may have no sudo at all in some setups.
+# Detect and set APT_PREFIX + PIP_USER_FLAG so install commands work in all
+# three regimes without rolling dice on default behavior.
+if [ "$(id -u)" = "0" ]; then
+    APT_PREFIX=""
+    PIP_USER_FLAG=""
+    PRIVILEGE="root"
+elif command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
+    APT_PREFIX="sudo "
+    PIP_USER_FLAG="--user"
+    PRIVILEGE="sudo (passwordless)"
+elif command -v sudo >/dev/null; then
+    APT_PREFIX="sudo "
+    PIP_USER_FLAG="--user"
+    PRIVILEGE="sudo (interactive; may prompt for password)"
+else
+    APT_PREFIX=""
+    PIP_USER_FLAG="--user"
+    PRIVILEGE="unprivileged; no sudo — apt-get steps will be SKIPPED, manual install may be needed"
+fi
+echo "Privilege: $(whoami) (uid=$(id -u)); apt prefix='${APT_PREFIX:-<none>}'; pip flag='${PIP_USER_FLAG:-<none>}' — $PRIVILEGE"
 echo
 
 # 1. Verify CUDA presence
@@ -60,13 +84,20 @@ if [ -n "$SUBDIR" ] && [ -d "$SUBDIR" ]; then
 fi
 echo "[3/7] In: $(pwd)"
 
-# 4. Install Python deps for HF sync (background)
+# 4. Install Python deps for HF sync (background).
+# pip flag varies by privilege: root installs system-wide, non-root needs --user.
 echo
-echo "[4/7] Installing huggingface_hub (Python)..."
+echo "[4/7] Installing huggingface_hub (Python, pip $PIP_USER_FLAG)..."
 if command -v pip3 >/dev/null; then
-    pip3 install -q -U huggingface_hub
+    pip3 install -q -U $PIP_USER_FLAG huggingface_hub || \
+        python3 -m pip install -q -U $PIP_USER_FLAG huggingface_hub
 else
-    python3 -m pip install -q -U huggingface_hub
+    python3 -m pip install -q -U $PIP_USER_FLAG huggingface_hub
+fi
+# When pip installs with --user, ~/.local/bin may not be in PATH yet.
+if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    export PATH="$HOME/.local/bin:$PATH"
+    echo "  Added \$HOME/.local/bin to PATH (pip --user install location)"
 fi
 # Test hf CLI presence
 if command -v hf >/dev/null; then

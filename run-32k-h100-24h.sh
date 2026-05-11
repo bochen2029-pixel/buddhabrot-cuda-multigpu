@@ -27,13 +27,37 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # -------------------------------------------------------------------------
-# Pre-flight
+# Pre-flight + privilege detection
 # -------------------------------------------------------------------------
 echo "============================================================"
 echo "Single H100 32K production render — 24 hour budget"
 echo "============================================================"
 echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Host: $(hostname)"
+echo "User: $(whoami)"
+
+# Hyperbolic doesn't give root; RunPod does. Detect once and branch installs.
+if [ "$(id -u)" = "0" ]; then
+    APT_PREFIX=""
+    PIP_USER_FLAG=""
+    PRIVILEGE="root"
+elif command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
+    APT_PREFIX="sudo "
+    PIP_USER_FLAG="--user"
+    PRIVILEGE="sudo (passwordless)"
+elif command -v sudo >/dev/null; then
+    APT_PREFIX="sudo "
+    PIP_USER_FLAG="--user"
+    PRIVILEGE="sudo (interactive)"
+else
+    APT_PREFIX=""
+    PIP_USER_FLAG="--user"
+    PRIVILEGE="unprivileged; apt-get steps will be SKIPPED"
+fi
+echo "Privilege: $(whoami) (uid=$(id -u)); apt prefix='${APT_PREFIX:-<none>}'; pip flag='${PIP_USER_FLAG:-<none>}' — $PRIVILEGE"
+if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
 echo
 
 if ! command -v nvidia-smi >/dev/null; then
@@ -64,18 +88,32 @@ if [ ! -f imap.bin ]; then
     ./build_imap.sh
 fi
 
-# Install screen if missing
+# Install screen if missing. Use privilege-appropriate command.
 if ! command -v screen >/dev/null; then
-    echo "[deps] installing screen..."
-    apt-get update -qq && apt-get install -y -qq screen
+    if [ -z "$APT_PREFIX" ] && [ "$PRIVILEGE" != "root" ]; then
+        echo "[deps] WARN: 'screen' missing and no apt privilege. Render will run in"
+        echo "       foreground; SSH disconnect will kill it. Alternatives:"
+        echo "         (a) ask pod admin to install screen, OR"
+        echo "         (b) use 'tmux' if it's preinstalled, OR"
+        echo "         (c) use 'nohup ./run-cloud-hyperbolic.sh &' instead of this wrapper"
+        echo "       Continuing without screen — render will be foreground."
+        USE_SCREEN=0
+    else
+        echo "[deps] installing screen (${APT_PREFIX}apt-get)..."
+        ${APT_PREFIX}apt-get update -qq && ${APT_PREFIX}apt-get install -y -qq screen
+        USE_SCREEN=1
+    fi
+else
+    USE_SCREEN=1
 fi
 
 # HF auth (only if env set)
 HF_SYNC_ENABLED=0
 if [ -n "${HF_TOKEN:-}" ] && [ -n "${HF_BUCKET:-}" ]; then
     if ! command -v hf >/dev/null; then
-        echo "[hf] installing huggingface_hub..."
-        pip install -U -q huggingface_hub
+        echo "[hf] installing huggingface_hub (pip $PIP_USER_FLAG)..."
+        pip install -U -q $PIP_USER_FLAG huggingface_hub || \
+            python3 -m pip install -U -q $PIP_USER_FLAG huggingface_hub
     fi
     if hf auth login --token "$HF_TOKEN" 2>&1 | grep -q "Login successful\|Token is valid"; then
         HF_SYNC_ENABLED=1
@@ -132,16 +170,17 @@ echo "[config] SIGUSR1 at: T+$((WALLCLOCK_HARD_CAP - SIGUSR1_LEAD))s ($(((WALLCL
 echo "[config] trims:      R=$TRIM_R G=$TRIM_G B=$TRIM_B (predicted for 1.5T density)"
 
 # -------------------------------------------------------------------------
-# Launch inside detached screen so it survives disconnects
+# Launch — prefer detached screen so it survives SSH disconnects; fall back
+# to nohup-in-background if screen unavailable.
 # -------------------------------------------------------------------------
 SESSION="h100_32k"
 
-# Kill any prior session with this name
-screen -S "$SESSION" -X quit 2>/dev/null || true
-sleep 1
+if [ "${USE_SCREEN:-1}" = "1" ]; then
+    # Kill any prior session with this name
+    screen -S "$SESSION" -X quit 2>/dev/null || true
+    sleep 1
 
-# Build the launch command (uses run-cloud-hyperbolic.sh as the watchdog wrapper)
-LAUNCH_CMD="\
+    LAUNCH_CMD="\
 export N_DEVICES=$N_DEVICES; \
 export WIDTH=$WIDTH; \
 export HEIGHT=$HEIGHT; \
@@ -161,16 +200,39 @@ export HF_SYNC_ENABLED=$HF_SYNC_ENABLED; \
 echo 'Render exited at '\$(date -u); \
 exec bash"
 
-screen -dmS "$SESSION" bash -c "$LAUNCH_CMD"
-sleep 2
+    screen -dmS "$SESSION" bash -c "$LAUNCH_CMD"
+    sleep 2
 
-if screen -ls | grep -q "$SESSION"; then
-    echo
-    echo "[launch] render running in screen session '$SESSION'"
-    echo "[launch] PID: $(screen -ls | grep "$SESSION" | awk '{print $1}' | cut -d. -f1)"
+    if screen -ls | grep -q "$SESSION"; then
+        echo
+        echo "[launch] render running in screen session '$SESSION'"
+        echo "[launch] PID: $(screen -ls | grep "$SESSION" | awk '{print $1}' | cut -d. -f1)"
+    else
+        echo "ERROR: screen session failed to start"
+        exit 1
+    fi
 else
-    echo "ERROR: screen session failed to start"
-    exit 1
+    # nohup fallback — render survives SSH disconnect via SIGHUP ignore,
+    # but no interactive reattach. Output goes to nohup.out + stderr.log.
+    echo
+    echo "[launch] starting render via nohup (no screen available)"
+    nohup bash -c "\
+export N_DEVICES=$N_DEVICES \
+       WIDTH=$WIDTH HEIGHT=$HEIGHT \
+       TARGET_SAMPLES=$TARGET_SAMPLES \
+       TRIM_R=$TRIM_R TRIM_G=$TRIM_G TRIM_B=$TRIM_B \
+       CHECKPOINT_EVERY=$CHECKPOINT_EVERY \
+       LAUNCHES_PER_ROUND=$LAUNCHES_PER_ROUND \
+       SAMPLES_PER_THREAD=$SAMPLES_PER_THREAD \
+       WALLCLOCK_HARD_CAP=$WALLCLOCK_HARD_CAP \
+       SIGUSR1_LEAD=$SIGUSR1_LEAD \
+       OUTPUT_BASE=$OUTPUT_BASE \
+       HF_BUCKET=$HF_BUCKET \
+       HF_SYNC_ENABLED=$HF_SYNC_ENABLED; \
+./run-cloud-hyperbolic.sh" > nohup_render.log 2>&1 &
+    RENDER_BG_PID=$!
+    disown
+    echo "[launch] render running in background, PID $RENDER_BG_PID  log: nohup_render.log"
 fi
 
 # -------------------------------------------------------------------------
@@ -181,24 +243,36 @@ echo "============================================================"
 echo "Render is going. Useful commands:"
 echo "============================================================"
 echo
-echo "  # Attach to the running screen (Ctrl-A D to detach without killing):"
-echo "  screen -r $SESSION"
+if [ "${USE_SCREEN:-1}" = "1" ]; then
+    echo "  # Attach to the running screen (Ctrl-A D to detach without killing):"
+    echo "  screen -r $SESSION"
+    echo
+    echo "  # Manually kill the render (rare):"
+    echo "  screen -S $SESSION -X stuff \$'\\003'"
+else
+    echo "  # Render in background (no screen). Tail nohup output:"
+    echo "  tail -f nohup_render.log"
+    echo
+    echo "  # Render PID: ${RENDER_BG_PID:-(check via pgrep buddhabrot)}"
+    echo "  # Manually kill the render (rare):"
+    echo "  kill -USR1 \$(cat $OUTPUT_BASE.pid 2>/dev/null) 2>/dev/null  # graceful save+exit"
+    echo "  # or: pkill -USR1 buddhabrot"
+fi
 echo
-echo "  # Tail the stderr log:"
+echo "  # Tail the renderer stderr log:"
 echo "  tail -f $OUTPUT_BASE.stderr.log"
 echo
 echo "  # Quick health check:"
 echo "  nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw --format=csv"
 echo "  ls -lh $OUTPUT_BASE*.bin 2>/dev/null"
 echo
-echo "  # Linux-level shutdown safety net (recommended): 24 hr from now"
-echo "  sudo shutdown +1440   # cancel anytime with: sudo shutdown -c"
-echo
+if [ "$PRIVILEGE" = "root" ] || [ -n "$APT_PREFIX" ]; then
+    echo "  # Linux-level shutdown safety net (recommended): 24 hr from now"
+    echo "  ${APT_PREFIX}shutdown +1440   # cancel anytime with: ${APT_PREFIX}shutdown -c"
+    echo
+fi
 echo "  # Monitor HF bucket from your laptop:"
 echo "  https://huggingface.co/buckets/$HF_BUCKET"
-echo
-echo "  # Manually kill the render (rare):"
-echo "  screen -S $SESSION -X stuff \$'\\003'"
 echo
 echo "Expected timeline (at 12 M/s on H100):"
 echo "  T+1 hr   first checkpoint, ~67 B samples in cp.bin (HF sync ~5 min later)"
