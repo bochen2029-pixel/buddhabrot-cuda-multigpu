@@ -27,6 +27,27 @@ trim_g = float(positional[1]) if len(positional) > 1 else 0.098
 trim_b = float(positional[2]) if len(positional) > 2 else 0.056
 flip_180 = "--flip" in sys.argv or "--rotate-180" in sys.argv
 
+# Tile-quality controls. Defaults to high-quality JPG (q92). Override via:
+#   --png            lossless PNG tiles (5-10x bigger pyramid, archival quality)
+#   --jpg-quality N  set JPG quality 1-100 (default 92; was 85 historically)
+#   --webp           modern lossy with better quality/size than JPG at same Q
+use_png = "--png" in sys.argv
+use_webp = "--webp" in sys.argv
+jpg_quality = 92
+for i, a in enumerate(sys.argv):
+    if a == "--jpg-quality" and i + 1 < len(sys.argv):
+        jpg_quality = int(sys.argv[i + 1])
+
+if use_png:
+    tile_suffix = ".png"
+    tile_format_label = "PNG (lossless)"
+elif use_webp:
+    tile_suffix = f".webp[Q={jpg_quality}]"
+    tile_format_label = f"WebP Q={jpg_quality}"
+else:
+    tile_suffix = f".jpg[Q={jpg_quality}]"
+    tile_format_label = f"JPG Q={jpg_quality}"
+
 if out_dir.exists():
     shutil.rmtree(out_dir)
 out_dir.mkdir(parents=True)
@@ -41,6 +62,7 @@ print(f"Source: {bin_path}")
 print(f"  {width}×{height}, samples_done={samples_done:,}")
 print(f"  trims R={trim_r} G={trim_g} B={trim_b}")
 print(f"  flip 180°: {flip_180}")
+print(f"  tile format: {tile_format_label}")
 
 hist = np.memmap(bin_path, dtype=np.uint64, mode="r",
                  offset=128, shape=(height, width, 3))
@@ -104,7 +126,7 @@ print(f"  pyvips image: {img.width}×{img.height}, {img.bands} bands")
 pyramid_prefix = str(out_dir / "pyramid")
 img.dzsave(
     pyramid_prefix,
-    suffix=".jpg[Q=85]",
+    suffix=tile_suffix,
     tile_size=256,
     overlap=0,
 )
@@ -112,8 +134,10 @@ print(f"  dzsave done in {time.time()-t2:.1f}s")
 
 # Count tiles
 files_dir = Path(pyramid_prefix + "_files")
-tile_count = sum(1 for _ in files_dir.rglob("*.jpg"))
-total_size = sum(p.stat().st_size for p in files_dir.rglob("*.jpg"))
+# Glob pattern matches actual tile extension (.jpg / .png / .webp)
+tile_ext = "*.png" if use_png else ("*.webp" if use_webp else "*.jpg")
+tile_count = sum(1 for _ in files_dir.rglob(tile_ext))
+total_size = sum(p.stat().st_size for p in files_dir.rglob(tile_ext))
 print(f"  pyramid: {tile_count} tiles, {total_size / 1e6:.1f} MB total")
 
 # -------- Pass 4: write HTML viewer + launch script --------
