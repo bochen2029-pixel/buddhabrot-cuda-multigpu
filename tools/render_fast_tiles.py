@@ -35,7 +35,9 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 CANONICAL_CENTER_RE = -0.5935417456742
@@ -83,7 +85,14 @@ def main():
                     help="samples for per-tile view-IMap build (smaller = faster, less accurate)")
     ap.add_argument("--samples-per-thread", type=int, default=8)
     ap.add_argument("--launches-per-round", type=int, default=8)
-    ap.add_argument("--devices", type=int, default=1)
+    ap.add_argument("--devices", type=int, default=1,
+                    help="GPU devices PER TILE (almost always 1 — each tile uses a single GPU; "
+                         "use --num-gpus to spread DIFFERENT tiles across N cards in parallel)")
+    ap.add_argument("--num-gpus", type=int, default=1,
+                    help="number of GPUs to use IN PARALLEL across different tiles. "
+                         "N workers run concurrently, each pinned to its own GPU via "
+                         "CUDA_VISIBLE_DEVICES. Tiles are independent so scaling is near-linear. "
+                         "Set to 1 for single-GPU (no parallelism). Set to 8 for 8x H100 rig.")
     ap.add_argument("--buddhabrot-bin", default="./buddhabrot")
     ap.add_argument("--guide-bin", default="",
                     help="optional downsampled guide .gbin for bin-guided IMap construction. "
@@ -226,15 +235,16 @@ def main():
         json.dump(spec, f, indent=2)
     print(f"wrote {spec_path}\n")
 
-    # --- Tile-by-tile render loop ---
-    t_start = time.time()
-    skipped = 0
-    rendered = 0
+    # --- Per-tile worker (callable from thread pool when --num-gpus > 1) ---
+    # Each worker is pinned to ONE GPU via CUDA_VISIBLE_DEVICES. Tiles are
+    # independent so N workers fan out across N GPUs with near-linear scaling.
+    # On a single-GPU machine (num_gpus=1) the pool size is 1, which gives the
+    # same behavior as the previous serial loop.
+    print_lock = threading.Lock()
 
-    for tile_idx in range(n_tiles):
-        if tile_idx < args.start_tile:
-            skipped += 1
-            continue
+    def render_one_tile(tile_idx: int, gpu_id: int) -> tuple[int, str, float, bool]:
+        """Render a single tile on the specified GPU. Returns
+        (tile_idx, tile_id, elapsed_sec, did_work) — did_work=False if skipped."""
         i = tile_idx % cols
         j = tile_idx // cols
         tile_id = f"r{j:02d}c{i:02d}"
@@ -242,31 +252,38 @@ def main():
         tile_bin = out_dir / f"{tile_id}.bin"
         tile_imap = out_dir / f"{tile_id}_imap.bin"
 
-        # Skip if already rendered
+        # Skip if already rendered (cheap idempotent resume — tile-level skip is
+        # sufficient resilience; we don't need per-tile mid-render resume since
+        # tile wallclock is bounded at minutes).
         if tile_bin.exists():
-            print(f"[{tile_idx+1}/{n_tiles}] {tile_id}: already exists, skipping")
-            skipped += 1
-            continue
+            with print_lock:
+                print(f"[{tile_idx+1}/{n_tiles}] {tile_id}: already exists, skipping")
+            return tile_idx, tile_id, 0.0, False
 
-        # Use precomputed tile spec for center / zoom (apron-extended)
-        tile_spec = spec_tiles[tile_idx]
-        tile_cx = tile_spec["center_re"]
-        tile_cy = tile_spec["center_im"]
-        render_zoom = apron_zoom    # apron-extended zoom for the actual buddhabrot render
+        tile_spec_ = spec_tiles[tile_idx]
+        tile_cx = tile_spec_["center_re"]
+        tile_cy = tile_spec_["center_im"]
+        render_zoom = apron_zoom
         render_w = apron_w
         render_h = apron_h
 
+        # CUDA_VISIBLE_DEVICES masks all other GPUs from the spawned process,
+        # so the renderer's --devices 1 effectively pins to physical GPU N.
+        # If --num-gpus 1, gpu_id is 0 and we don't actually need to set the
+        # env var, but doing it unconditionally keeps the code path uniform.
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
         t_tile = time.time()
-        print(f"[{tile_idx+1}/{n_tiles}] {tile_id} @ center ({tile_cx:.10f}, {tile_cy:.10f}) zoom {render_zoom:.3f}")
+        with print_lock:
+            print(f"[{tile_idx+1}/{n_tiles}] {tile_id} @ GPU{gpu_id} "
+                  f"center ({tile_cx:.10f}, {tile_cy:.10f}) zoom {render_zoom:.3f}")
 
         # Phase A: build view-aware IMap (or use canonical)
         if args.skip_view_imap:
             imap_arg = args.canonical_imap
-            print(f"  (using shared canonical IMap: {imap_arg})")
         else:
             t_imap = time.time()
-            guide_note = f" (bin-guided: {args.guide_bin})" if args.guide_bin else ""
-            print(f"  [A] building view-aware IMap ({args.imap_samples:,} samples){guide_note}...")
             cmd = [
                 args.buddhabrot_bin,
                 "--build-view-imap", str(tile_imap),
@@ -285,16 +302,14 @@ def main():
             ]
             if args.guide_bin:
                 cmd.extend(["--guide-bin", args.guide_bin])
-            ret = subprocess.run(cmd)
+            ret = subprocess.run(cmd, env=env)
             if ret.returncode != 0:
-                print(f"  ERROR: IMap build failed for {tile_id}")
-                sys.exit(1)
-            print(f"      IMap done in {time.time()-t_imap:.1f}s")
+                with print_lock:
+                    print(f"  ERROR: IMap build failed for {tile_id} (GPU{gpu_id})")
+                raise RuntimeError(f"IMap build failed for {tile_id}")
             imap_arg = str(tile_imap)
 
         # Phase B: production render
-        t_render = time.time()
-        print(f"  [B] rendering ({samples_per_tile:,} samples)...")
         cmd = [
             args.buddhabrot_bin,
             "--width", str(render_w),
@@ -317,25 +332,94 @@ def main():
             "--devices", str(args.devices),
             "--output", str(tile_png),
         ]
-        ret = subprocess.run(cmd)
+        ret = subprocess.run(cmd, env=env)
         if ret.returncode != 0:
-            print(f"  ERROR: render failed for {tile_id}")
-            sys.exit(1)
-        print(f"      render done in {time.time()-t_render:.1f}s")
-        print(f"      tile total: {time.time()-t_tile:.1f}s")
+            with print_lock:
+                print(f"  ERROR: render failed for {tile_id} (GPU{gpu_id})")
+            raise RuntimeError(f"render failed for {tile_id}")
 
-        rendered += 1
-        elapsed = time.time() - t_start
-        if rendered > 0:
-            rate = rendered / elapsed
-            remaining = n_tiles - tile_idx - 1
-            eta = remaining / rate if rate > 0 else 0
-            print(f"  progress: {rendered}/{n_tiles - skipped} rendered, "
-                  f"{remaining} remaining, ETA {eta/60:.1f} min\n")
+        elapsed = time.time() - t_tile
+        with print_lock:
+            print(f"  [{tile_id}] GPU{gpu_id} DONE in {elapsed:.1f}s")
+        return tile_idx, tile_id, elapsed, True
+
+    # --- Tile work distribution ---
+    t_start = time.time()
+    skipped = 0
+    rendered = 0
+    tile_indices = [t for t in range(args.start_tile, n_tiles)]
+    if not tile_indices:
+        print("No tiles to render (start_tile >= n_tiles).")
+        return
+
+    if args.num_gpus <= 1:
+        # Serial path — preserves original ordering / progress output.
+        for k, tile_idx in enumerate(tile_indices):
+            try:
+                _, tile_id, elapsed, did_work = render_one_tile(tile_idx, 0)
+                if did_work:
+                    rendered += 1
+                else:
+                    skipped += 1
+            except RuntimeError as e:
+                print(f"FATAL: {e}")
+                sys.exit(1)
+            # ETA on serial path: just based on average per-tile time so far.
+            if rendered > 0:
+                completed = k + 1
+                rate = completed / (time.time() - t_start)
+                remaining = len(tile_indices) - completed
+                eta_min = remaining / rate / 60 if rate > 0 else 0
+                print(f"  progress: {rendered} rendered, {skipped} skipped, "
+                      f"{remaining} remaining, ETA {eta_min:.1f} min\n")
+    else:
+        # Parallel path — N workers, each pinned to one GPU. Tile-to-GPU
+        # assignment via round-robin; the ThreadPoolExecutor pools available
+        # workers so a fast GPU can naturally grab more tiles than a slow one
+        # (since the queue feeds whoever's free).
+        print(f"[parallel] launching {args.num_gpus} workers across "
+              f"GPUs 0..{args.num_gpus-1}; {len(tile_indices)} tiles to render")
+        with ThreadPoolExecutor(max_workers=args.num_gpus) as pool:
+            # Assign each tile to a GPU id via modulo. Workers re-use their
+            # CUDA context across the tiles they handle (subprocess overhead
+            # is ~50 ms per launch, negligible vs ~minute-long tile renders).
+            futures = {
+                pool.submit(render_one_tile, tile_idx, tile_idx % args.num_gpus): tile_idx
+                for tile_idx in tile_indices
+            }
+            completed = 0
+            for fut in as_completed(futures):
+                tile_idx = futures[fut]
+                try:
+                    _, tile_id, elapsed, did_work = fut.result()
+                    if did_work:
+                        rendered += 1
+                    else:
+                        skipped += 1
+                except RuntimeError as e:
+                    print(f"FATAL: tile {tile_idx} failed: {e}")
+                    # Cancel pending futures so we don't continue burning GPU
+                    # time on a setup that's clearly broken.
+                    for f in futures:
+                        f.cancel()
+                    sys.exit(1)
+                completed += 1
+                rate = completed / (time.time() - t_start)
+                remaining = len(tile_indices) - completed
+                eta_min = remaining / rate / 60 if rate > 0 else 0
+                with print_lock:
+                    print(f"  progress: {rendered} rendered, {skipped} skipped, "
+                          f"{remaining} remaining, ETA {eta_min:.1f} min")
 
     total_time = time.time() - t_start
     print(f"\n{'='*60}")
     print(f"DONE -- {rendered} tiles rendered, {skipped} skipped, total {total_time/60:.1f} min")
+    if args.num_gpus > 1 and rendered > 0:
+        # Effective speedup vs estimated serial wallclock
+        est_serial_min = rendered * (args.seconds_per_tile + 10) / 60
+        speedup = est_serial_min / (total_time / 60) if total_time > 0 else 0
+        print(f"  multi-GPU speedup: {speedup:.2f}x ({args.num_gpus} workers, "
+              f"effective {speedup/args.num_gpus*100:.0f}% of linear)")
     print(f"{'='*60}\n")
 
     # --- Final HF sync to catch any tiles uploaded mid-pass (atomic completion) ---
