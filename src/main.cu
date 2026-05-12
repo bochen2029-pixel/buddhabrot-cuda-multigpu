@@ -242,11 +242,13 @@ __device__ __forceinline__ void increment_pixel_channel(
     unsigned long long weight, const Params& P)
 {
     if (pixel.x < 0 || pixel.y < 0 || pixel.x >= P.width || pixel.y >= P.height) return;
-    unsigned int pixels  = (unsigned int)P.width * (unsigned int)P.height;
-    unsigned int idx     = ((unsigned int)pixel.y * (unsigned int)P.width
-                          + (unsigned int)pixel.x) * 3u + channel;
+    // 64-bit indexing: at 64K (3.22 G pixels), the histogram has 9.66 G uint64 slots.
+    // Any 32-bit index multiplication by 3 overflows; force size_t/uint64 arithmetic.
+    size_t pixels  = (size_t)P.width * (size_t)P.height;
+    size_t idx     = ((size_t)pixel.y * (size_t)P.width
+                    + (size_t)pixel.x) * (size_t)3 + (size_t)channel;
     unsigned long long new_val = atomicAdd(&histogram[idx], weight) + weight;
-    unsigned int max_idx = pixels * 3u + channel;
+    size_t max_idx = pixels * (size_t)3 + (size_t)channel;
     atomicMax(&histogram[max_idx], new_val);
 }
 
@@ -487,21 +489,24 @@ __global__ void buddhabrot_kernel(
 __global__ void sum_pixels_kernel(
     unsigned long long* __restrict__ dest,
     const unsigned long long* __restrict__ src,
-    unsigned int n_pixel_words)
+    size_t n_pixel_words)
 {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // 64-bit thread index: at 64K, the kernel launches 9.66G threads, which
+    // exceeds 32-bit. Compose from (blockIdx.x * blockDim.x + threadIdx.x).
+    size_t idx = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
     if (idx >= n_pixel_words) return;
     dest[idx] += src[idx];
 }
 
 __global__ void compute_max_kernel(
     unsigned long long* __restrict__ hist,
-    unsigned int pixels)
+    size_t pixels)
 {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= pixels * 3u) return;
-    unsigned int channel = idx % 3u;
-    unsigned int max_idx = pixels * 3u + channel;
+    size_t idx = (size_t)blockIdx.x * (size_t)blockDim.x + (size_t)threadIdx.x;
+    size_t total_words = pixels * (size_t)3;
+    if (idx >= total_words) return;
+    unsigned int channel = (unsigned int)(idx % 3u);
+    size_t max_idx = total_words + (size_t)channel;
     atomicMax(&hist[max_idx], hist[idx]);
 }
 
@@ -651,23 +656,25 @@ __global__ void tonemap_kernel(
     unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= (unsigned)P.width || y >= (unsigned)P.height) return;
 
-    unsigned int pixels   = (unsigned int)P.width * (unsigned int)P.height;
-    unsigned int hist_idx = (y * (unsigned)P.width + x) * 3u;
+    // 64-bit indexing for 64K+ resolutions. x,y fit in 32-bit (max 65536 each),
+    // but their product times 3 overflows at 64K (3.22 G * 3 = 9.66 G > 4.29 G).
+    size_t pixels   = (size_t)P.width * (size_t)P.height;
+    size_t hist_idx = ((size_t)y * (size_t)P.width + (size_t)x) * (size_t)3;
 
     // uint64 → double cast for tonemap arithmetic. fp64 has 53 bits of
     // mantissa, so up to ~9e15 represents exactly; well within budget.
-    double r_count = (double)histogram[hist_idx + 0u];
-    double g_count = (double)histogram[hist_idx + 1u];
-    double b_count = (double)histogram[hist_idx + 2u];
+    double r_count = (double)histogram[hist_idx + 0];
+    double g_count = (double)histogram[hist_idx + 1];
+    double b_count = (double)histogram[hist_idx + 2];
 
     // Per-channel trim: multiplier on the effective max for tone-grading.
     // trim < 1 brightens that channel (lower effective max → higher t).
     // trim = 1 is the WGSL behavior. The HIST_SCALE factor cancels because
     // both count and max carry it.
-    unsigned int max_base = pixels * 3u;
-    double r_max = fmax((double)histogram[max_base + 0u] * (double)P.trim_r, (double)P.normalization_floor);
-    double g_max = fmax((double)histogram[max_base + 1u] * (double)P.trim_g, (double)P.normalization_floor);
-    double b_max = fmax((double)histogram[max_base + 2u] * (double)P.trim_b, (double)P.normalization_floor);
+    size_t max_base = pixels * (size_t)3;
+    double r_max = fmax((double)histogram[max_base + 0] * (double)P.trim_r, (double)P.normalization_floor);
+    double g_max = fmax((double)histogram[max_base + 1] * (double)P.trim_g, (double)P.normalization_floor);
+    double b_max = fmax((double)histogram[max_base + 2] * (double)P.trim_b, (double)P.normalization_floor);
 
     float rt = (float)fmin(fmax(r_count / r_max, 0.0), 1.0);
     float gt = (float)fmin(fmax(g_count / g_max, 0.0), 1.0);
@@ -682,7 +689,7 @@ __global__ void tonemap_kernel(
     uint16_t b16 = (uint16_t)fminf(roundf(b * 65535.0f), 65535.0f);
 
     unsigned int out_y   = (unsigned)P.height - 1u - y;
-    unsigned int out_idx = (out_y * (unsigned)P.width + x) * 3u;
+    size_t out_idx = ((size_t)out_y * (size_t)P.width + (size_t)x) * (size_t)3;
     out[out_idx + 0u] = bswap16(r16);
     out[out_idx + 1u] = bswap16(g16);
     out[out_idx + 2u] = bswap16(b16);
@@ -1531,8 +1538,14 @@ int main(int argc, char** argv) {
 
         // Merge if multi-GPU
         if (n_devices > 1) {
-            unsigned int n_pixel_words = (unsigned int)pixels * 3u;
-            unsigned int blocks_sum    = (n_pixel_words + 255u) / 256u;
+            // 64-bit launch math: at 64K, n_pixel_words = 9.66 G — overflows
+            // 32-bit. blocks_sum fits 32-bit (37.7M at 64K, well under CUDA's
+            // 2^31 - 1 cap per gridDim.x), but the parameter passed into kernel
+            // must be size_t so the kernel's bounds check works correctly.
+            size_t n_pixel_words = (size_t)pixels * (size_t)3;
+            size_t blocks_needed = (n_pixel_words + 255) / 256;
+            // CUDA gridDim.x max is 2^31 - 1 ~ 2.1B blocks, so this fits.
+            unsigned int blocks_sum = (unsigned int)blocks_needed;
             for (int d = 1; d < n_devices; d++) {
                 check(cudaMemcpyPeer(d_staging, 0, d_hist[d], d, hist_bytes), "memcpy peer");
                 sum_pixels_kernel<<<blocks_sum, 256>>>(d_hist[0], d_staging, n_pixel_words);
@@ -1544,9 +1557,9 @@ int main(int argc, char** argv) {
                 check(cudaSetDevice(0), "back to dev 0");
             }
             // Recompute master max slots from the merged pixel data.
-            check(cudaMemset(d_hist[0] + pixels * 3, 0, 3 * sizeof(unsigned long long)),
+            check(cudaMemset(d_hist[0] + (size_t)pixels * 3, 0, 3 * sizeof(unsigned long long)),
                   "zero master max slots");
-            compute_max_kernel<<<blocks_sum, 256>>>(d_hist[0], (unsigned int)pixels);
+            compute_max_kernel<<<blocks_sum, 256>>>(d_hist[0], (size_t)pixels);
             check(cudaDeviceSynchronize(), "merge max sync");
         }
 
