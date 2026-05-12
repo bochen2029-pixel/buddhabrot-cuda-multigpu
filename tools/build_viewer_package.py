@@ -27,13 +27,18 @@ trim_g = float(positional[1]) if len(positional) > 1 else 0.098
 trim_b = float(positional[2]) if len(positional) > 2 else 0.056
 flip_180 = "--flip" in sys.argv or "--rotate-180" in sys.argv
 
-# Tile-quality controls. Defaults to high-quality JPG (q92). Override via:
-#   --png            lossless PNG tiles (5-10x bigger pyramid, archival quality)
-#   --jpg-quality N  set JPG quality 1-100 (default 92; was 85 historically)
+# Tile-quality controls. Defaults to high-quality JPG (q95). Override via:
+#   --png            lossless PNG tiles (5-10x bigger pyramid, archival quality —
+#                    eliminates ALL compression artifacts at deep zoom)
+#   --jpg-quality N  set JPG quality 1-100 (default 95; visually near-lossless)
 #   --webp           modern lossy with better quality/size than JPG at same Q
+#
+# Recommendation: --png for renders you want to deep-zoom critically (archival,
+# sharing with Melinda, etc). Default JPG q95 for normal viewing — fast loads,
+# tiny tiles, only the most aggressive zoom reveals artifacts.
 use_png = "--png" in sys.argv
 use_webp = "--webp" in sys.argv
-jpg_quality = 92
+jpg_quality = 95
 for i, a in enumerate(sys.argv):
     if a == "--jpg-quality" and i + 1 < len(sys.argv):
         jpg_quality = int(sys.argv[i + 1])
@@ -124,11 +129,15 @@ img = pyvips.Image.new_from_memory(
 print(f"  pyvips image: {img.width}×{img.height}, {img.bands} bands")
 
 pyramid_prefix = str(out_dir / "pyramid")
+# overlap=2: each tile shares a 2-pixel border with its neighbors.
+# Eliminates visible grid seams when OpenSeadragon bilinear-scales tiles
+# at non-pyramid-boundary zoom levels. Standard DZI practice (default in
+# Microsoft's DeepZoom Composer). Cost: ~3% more tile data than overlap=0.
 img.dzsave(
     pyramid_prefix,
     suffix=tile_suffix,
     tile_size=256,
-    overlap=0,
+    overlap=2,
 )
 print(f"  dzsave done in {time.time()-t2:.1f}s")
 
