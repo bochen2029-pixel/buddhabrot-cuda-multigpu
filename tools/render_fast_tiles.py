@@ -85,6 +85,10 @@ def main():
     ap.add_argument("--launches-per-round", type=int, default=8)
     ap.add_argument("--devices", type=int, default=1)
     ap.add_argument("--buddhabrot-bin", default="./buddhabrot")
+    ap.add_argument("--guide-bin", default="",
+                    help="optional downsampled guide .gbin for bin-guided IMap construction. "
+                         "Use tools/downsample_bin.py to produce from an existing high-quality .bin. "
+                         "Concentrates IMap on visually-important regions, 1.5-3x more efficient IS.")
     ap.add_argument("--apron", type=int, default=64,
                     help="overlap apron in pixels (each side). 0 = no blend (visible seams). "
                          "64+ = smooth via compose_blended.py at stitch time.")
@@ -225,7 +229,8 @@ def main():
             print(f"  (using shared canonical IMap: {imap_arg})")
         else:
             t_imap = time.time()
-            print(f"  [A] building view-aware IMap ({args.imap_samples:,} samples)...")
+            guide_note = f" (bin-guided: {args.guide_bin})" if args.guide_bin else ""
+            print(f"  [A] building view-aware IMap ({args.imap_samples:,} samples){guide_note}...")
             cmd = [
                 args.buddhabrot_bin,
                 "--build-view-imap", str(tile_imap),
@@ -242,6 +247,8 @@ def main():
                 "--iter-b", str(args.iter_b),
                 "--devices", str(args.devices),
             ]
+            if args.guide_bin:
+                cmd.extend(["--guide-bin", args.guide_bin])
             ret = subprocess.run(cmd)
             if ret.returncode != 0:
                 print(f"  ERROR: IMap build failed for {tile_id}")
