@@ -129,15 +129,25 @@ img = pyvips.Image.new_from_memory(
 print(f"  pyvips image: {img.width}×{img.height}, {img.bands} bands")
 
 pyramid_prefix = str(out_dir / "pyramid")
-# overlap=2: each tile shares a 2-pixel border with its neighbors.
-# Eliminates visible grid seams when OpenSeadragon bilinear-scales tiles
-# at non-pyramid-boundary zoom levels. Standard DZI practice (default in
-# Microsoft's DeepZoom Composer). Cost: ~3% more tile data than overlap=0.
+# overlap=0: tiles are exactly tile_size × tile_size. OpenSeadragon places
+# them edge-to-edge with pixel-perfect alignment, no anti-aliasing at
+# boundaries, no gaps. Empirically clean for our libvips-generated pyramids.
+#
+# DO NOT change to overlap=2. The "standard DZI practice" of overlap=2 is
+# designed for slippy-map pipelines where individual tiles have JPG edge
+# quantization that needs masking. Our pyramid is sliced from a single
+# contiguous numpy array — there's no edge quantization to mask. With
+# overlap=2, OSD's tile placement at fractional zoom levels alpha-blends
+# tile boundaries with the body background, producing visible hairline
+# seams in a regular 256-pixel grid pattern. Verified regression: commit
+# 27f8308 changed 0→2 and reintroduced visible seams; commit cef5ddb
+# reverted it after empirical comparison with viewer_cp2560 confirmed the
+# regression. Stay at overlap=0.
 img.dzsave(
     pyramid_prefix,
     suffix=tile_suffix,
     tile_size=256,
-    overlap=2,
+    overlap=0,
 )
 print(f"  dzsave done in {time.time()-t2:.1f}s")
 
