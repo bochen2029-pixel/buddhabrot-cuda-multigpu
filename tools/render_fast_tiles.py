@@ -98,6 +98,18 @@ def main():
                     help="optional downsampled guide .gbin for bin-guided IMap construction. "
                          "Use tools/downsample_bin.py to produce from an existing high-quality .bin. "
                          "Concentrates IMap on visually-important regions, 1.5-3x more efficient IS.")
+    ap.add_argument("--classify-threshold", type=int, default=2000,
+                    help="when --guide-bin is set, tiles whose corresponding guide region max "
+                         "is BELOW this value use canonical IMap (--skip-view-imap) instead of "
+                         "bin-guided. Prevents extreme tonal islands at tile boundaries from "
+                         "over-concentration on dim regions. 0 disables classification. "
+                         "Default 2000 (~3%% of uint16 max).")
+    ap.add_argument("--guide-min-weight", type=int, default=8,
+                    help="floor for bin-guided IMap weights (passed to buddhabrot kernel). "
+                         "Each viewport-hit contributes max(guide_value>>8, FLOOR) to IMap. "
+                         "0 = pure bin-guided (creates tonal-island artifacts at tile boundaries). "
+                         "Default 8 ensures dim viewport regions still get baseline sampling, "
+                         "smoothing tile-tile tonal discontinuities. Tunable 0-64.")
     ap.add_argument("--hf-bucket", default="",
                     help="optional HF bucket name (e.g. bochen2079/buddhabrot). When set, the "
                          "script will start a background hf sync loop that uploads each tile's "
@@ -118,6 +130,36 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Optional: load the guide ONCE for per-tile classification ---
+    # When --guide-bin is set AND --classify-threshold > 0, we read the guide
+    # header + body, then for each tile look up the max guide value in that
+    # tile's image-space region. Tiles where max < threshold use canonical
+    # IMap (--skip-view-imap) instead of bin-guided. Prevents the extreme
+    # tonal-island problem that creates visible 16x16 grid artifacts at low
+    # zoom levels in OpenSeadragon.
+    guide_array = None       # 2D uint16 numpy array (lazy-loaded if needed)
+    guide_W = 0
+    guide_H = 0
+    if args.guide_bin and args.classify_threshold > 0:
+        import numpy as np
+        import struct as _struct
+        try:
+            with open(args.guide_bin, "rb") as gf:
+                gheader = gf.read(32)
+                if gheader[:4] != b"GBIN":
+                    print(f"WARN: guide file bad magic; tile classification DISABLED")
+                else:
+                    guide_W = _struct.unpack_from("<I", gheader, 8)[0]
+                    guide_H = _struct.unpack_from("<I", gheader, 12)[0]
+                    n_pixels = guide_W * guide_H
+                    raw = gf.read(n_pixels * 2)
+                    guide_array = np.frombuffer(raw, dtype=np.uint16).reshape(guide_H, guide_W)
+                    print(f"[classify] guide loaded for per-tile classification: "
+                          f"{guide_W}x{guide_H}, threshold={args.classify_threshold}")
+        except Exception as e:
+            print(f"WARN: couldn't load guide for classification: {e}")
+            guide_array = None
 
     # --- Tile geometry (same math as tile_orchestrate.py) ---
     canonical_y_span = 4.0 / (2.0 ** args.canonical_zoom)
@@ -279,11 +321,37 @@ def main():
             print(f"[{tile_idx+1}/{n_tiles}] {tile_id} @ GPU{gpu_id} "
                   f"center ({tile_cx:.10f}, {tile_cy:.10f}) zoom {render_zoom:.3f}")
 
+        # --- Per-tile classification (if guide loaded + threshold > 0) ---
+        # Look up the max guide value in this tile's image-space region.
+        # If below threshold, fall back to canonical IMap (--skip-view-imap):
+        # avoids extreme tonal islands from over-concentration on dim regions.
+        tile_use_guided = (args.guide_bin and not args.skip_view_imap)
+        tile_classify_reason = ""
+        if guide_array is not None and tile_use_guided:
+            # Tile (i,j) covers image region [i*tile_w:(i+1)*tile_w, j*tile_h:(j+1)*tile_h]
+            # in stitched-image coords. Scale to guide-image coords:
+            gx0 = (i      * guide_W) // cols
+            gx1 = ((i+1)  * guide_W) // cols
+            gy0 = (j      * guide_H) // rows
+            gy1 = ((j+1)  * guide_H) // rows
+            region_max = int(guide_array[gy0:gy1, gx0:gx1].max())
+            if region_max < args.classify_threshold:
+                tile_use_guided = False
+                tile_classify_reason = f"dim (guide_max={region_max} < {args.classify_threshold})"
+            else:
+                tile_classify_reason = f"bright (guide_max={region_max})"
+
         # Phase A: build view-aware IMap (or use canonical)
-        if args.skip_view_imap:
+        if args.skip_view_imap or not tile_use_guided:
             imap_arg = args.canonical_imap
+            if tile_classify_reason:
+                with print_lock:
+                    print(f"  [classify] {tile_id}: {tile_classify_reason} -> using canonical IMap")
         else:
             t_imap = time.time()
+            with print_lock:
+                if tile_classify_reason:
+                    print(f"  [classify] {tile_id}: {tile_classify_reason} -> bin-guided view IMap")
             cmd = [
                 args.buddhabrot_bin,
                 "--build-view-imap", str(tile_imap),
@@ -302,6 +370,8 @@ def main():
             ]
             if args.guide_bin:
                 cmd.extend(["--guide-bin", args.guide_bin])
+                if args.guide_min_weight > 0:
+                    cmd.extend(["--guide-min-weight", str(args.guide_min_weight)])
             ret = subprocess.run(cmd, env=env)
             if ret.returncode != 0:
                 with print_lock:

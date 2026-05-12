@@ -602,7 +602,8 @@ __global__ void view_imap_pass_kernel(
     unsigned int imap_iter_cap,
     const unsigned short* __restrict__ guide,
     unsigned int guide_width,
-    unsigned int guide_height)
+    unsigned int guide_height,
+    unsigned int guide_min_weight)
 {
     unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -652,7 +653,13 @@ __global__ void view_imap_pass_kernel(
                     if (gx >= guide_width)  gx = guide_width  - 1u;
                     if (gy >= guide_height) gy = guide_height - 1u;
                     unsigned int gv = (unsigned int)guide[(size_t)gy * guide_width + gx];
-                    weighted_hits += (gv >> 8);  // top-8-bits range [0,255]
+                    unsigned int w = (gv >> 8);  // top-8-bits range [0,255]
+                    // Apply weight floor: dim regions still get SOME contribution
+                    // (prevents over-concentration that creates per-tile tonal islands
+                    // when the bin-guided IMap deprioritizes entire viewport regions
+                    // to near-zero weight). guide_min_weight=0 = original behavior.
+                    if (w < guide_min_weight) w = guide_min_weight;
+                    weighted_hits += w;
                 }
             }
             if (z.x * z.x + z.y * z.y > P.bailout_radius_sq) {
@@ -806,6 +813,12 @@ static void print_usage(const char* argv0) {
         "                           concentrates samples on visually-important regions,\n"
         "                           accelerating IMap convergence by 1.5-3x. Build the\n"
         "                           guide with tools/downsample_bin.py.\n"
+        "  --guide-min-weight N     (optional, default 0) floor for bin-guided IMap weights.\n"
+        "                           Each viewport-hit's IMap contribution is max(guide>>8,N).\n"
+        "                           N=0 = pure bin-guided (extreme concentration, may produce\n"
+        "                           tonal-island artifacts at tile boundaries). Recommended\n"
+        "                           for tile pyramids: 4-16. Ensures dim viewport regions\n"
+        "                           still get some sampling.\n"
         "  --imap-resolution N      IMap grid resolution (default 1024)\n"
         "  --imap-samples N         total uniform samples for IMap construction\n"
         "                           (default 100000000)\n"
@@ -903,6 +916,15 @@ int main(int argc, char** argv) {
     std::string imap_heatmap_path;
     int build_view_aware_imap = 0;     // 0 = orbit-length weighting (Bitterli §B7),
                                         // 1 = viewport-hit weighting (per-tile renders)
+    unsigned int guide_min_weight = 0; // Optional floor for bin-guided IMap weights.
+                                        // 0 = original behavior (pure bin-guided, may produce
+                                        // extreme tonal islands at tile boundaries).
+                                        // Recommended for tile pyramids: 4-16. Each orbit's
+                                        // viewport-hit contributes max(guide_value>>8, floor)
+                                        // to its IMap cell. Ensures dim viewport regions
+                                        // still get some sampling, preventing the per-tile
+                                        // tonal-discontinuity grid pattern at low pyramid
+                                        // zoom levels.
     std::string guide_bin_path;        // Optional bin-guided IMap weighting:
                                         // when set during --build-view-imap, the kernel
                                         // weights cell increments by the guide's intensity
@@ -983,6 +1005,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--build-imap"))         build_imap_path = need(a);
         else if (!strcmp(a, "--build-view-imap"))    { build_imap_path = need(a); build_view_aware_imap = 1; }
         else if (!strcmp(a, "--guide-bin"))          guide_bin_path = need(a);
+        else if (!strcmp(a, "--guide-min-weight"))   guide_min_weight = (unsigned int)atoi(need(a));
         else if (!strcmp(a, "--imap-resolution"))    imap_resolution = (unsigned)atoi(need(a));
         else if (!strcmp(a, "--imap-samples"))       imap_samples = strtoull(need(a), nullptr, 10);
         else if (!strcmp(a, "--imap-iter-cap"))      imap_iter_cap = (unsigned)atoi(need(a));
@@ -1178,7 +1201,7 @@ int main(int argc, char** argv) {
             if (build_view_aware_imap) {
                 view_imap_pass_kernel<<<blocks_per_launch, threads_per_block, 0, stream_imap>>>(
                     d_imap, local_P, imap_resolution, imap_iter_cap,
-                    d_guide, guide_width, guide_height);
+                    d_guide, guide_width, guide_height, guide_min_weight);
             } else {
                 imap_pass_kernel<<<blocks_per_launch, threads_per_block, 0, stream_imap>>>(
                     d_imap, local_P, imap_resolution, imap_iter_cap);
