@@ -739,6 +739,13 @@ static void print_usage(const char* argv0) {
         "  --checkpoint-every N     merge+tonemap+save every N rounds (default 0=off)\n"
         "                           (each checkpoint writes <output>.cpNNNN.png;\n"
         "                            safe to interrupt — latest cp is usable)\n"
+        "  --checkpoint-schedule LIST  comma-separated list of specific round\n"
+        "                           numbers at which to checkpoint. Combines with\n"
+        "                           --checkpoint-every (both can fire). Example:\n"
+        "                           --checkpoint-schedule 590,1180,1770,2950,4130\n"
+        "                           gives non-uniform cadence (30/30/30/60/60 min\n"
+        "                           at 22 M/s). Entries less than resume-from\n"
+        "                           starting round are silently skipped.\n"
         "  --build-imap PATH        build importance map (Phase 1 of Bitterli IS),\n"
         "                           weighted by orbit length. Run once for canonical view\n"
         "                           and reuse via --imap.\n"
@@ -833,6 +840,8 @@ int main(int argc, char** argv) {
     double target_b             = 0.0;
 
     int checkpoint_every_rounds = 0;       // 0 = no checkpoints
+    std::vector<unsigned long long> checkpoint_schedule;  // explicit list of round numbers
+    size_t checkpoint_schedule_idx = 0;    // next unfired entry; advanced as schedule entries pass
 
     // Phase 1 (Bitterli importance map) build mode flags. Empty path = render mode.
     std::string build_imap_path;
@@ -896,6 +905,20 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--devices"))            requested_devices = atoi(need(a));
         else if (!strcmp(a, "--launches-per-round")) launches_per_round = atoi(need(a));
         else if (!strcmp(a, "--checkpoint-every"))   checkpoint_every_rounds = atoi(need(a));
+        else if (!strcmp(a, "--checkpoint-schedule")) {
+            // Parse comma-separated list of unsigned long long round numbers.
+            const char* csv = need(a);
+            const char* p = csv;
+            while (*p) {
+                char* end = nullptr;
+                unsigned long long r = strtoull(p, &end, 10);
+                if (end == p) break;
+                if (r > 0) checkpoint_schedule.push_back(r);
+                p = end;
+                while (*p == ',' || *p == ' ' || *p == '\t') p++;
+            }
+            std::sort(checkpoint_schedule.begin(), checkpoint_schedule.end());
+        }
         else if (!strcmp(a, "--build-imap"))         build_imap_path = need(a);
         else if (!strcmp(a, "--build-view-imap"))    { build_imap_path = need(a); build_view_aware_imap = 1; }
         else if (!strcmp(a, "--imap-resolution"))    imap_resolution = (unsigned)atoi(need(a));
@@ -1231,6 +1254,17 @@ int main(int argc, char** argv) {
         (unsigned long long)actual_total_samples, n_devices);
     if (checkpoint_every_rounds > 0) {
         fprintf(stderr, "Checkpoints     : every %d round(s)\n", checkpoint_every_rounds);
+    }
+    if (!checkpoint_schedule.empty()) {
+        fprintf(stderr, "Checkpoint sched: %zu explicit round(s):", checkpoint_schedule.size());
+        for (size_t i = 0; i < checkpoint_schedule.size() && i < 10; i++) {
+            fprintf(stderr, " %llu", (unsigned long long)checkpoint_schedule[i]);
+        }
+        if (checkpoint_schedule.size() > 10) {
+            fprintf(stderr, " ... %llu",
+                (unsigned long long)checkpoint_schedule[checkpoint_schedule.size() - 1]);
+        }
+        fprintf(stderr, "\n");
     }
     fprintf(stderr, "===========================================\n");
 
@@ -1715,9 +1749,28 @@ int main(int argc, char** argv) {
             (double)samples_this_run / elapsed / 1e6);
 
         // Checkpoint if requested (and not the very last round — final save handles that)
+        // Two trigger paths can each fire: --checkpoint-every (uniform cadence) and
+        // --checkpoint-schedule (explicit round-number list). Both can be active;
+        // a single round only saves once even if both conditions match.
+        bool should_checkpoint = false;
         if (checkpoint_every_rounds > 0 &&
-            (round + 1) % (unsigned long long)checkpoint_every_rounds == 0 &&
-            (round + 1) < n_rounds) {
+            (round + 1) % (unsigned long long)checkpoint_every_rounds == 0) {
+            should_checkpoint = true;
+        }
+        // Schedule check: advance index past any entries the loop has already passed
+        // (handles out-of-order entries defensively, plus resume-from edge cases where
+        // the schedule list may contain rounds already completed in a prior invocation).
+        while (checkpoint_schedule_idx < checkpoint_schedule.size() &&
+               checkpoint_schedule[checkpoint_schedule_idx] < (round + 1)) {
+            checkpoint_schedule_idx++;
+        }
+        if (checkpoint_schedule_idx < checkpoint_schedule.size() &&
+            checkpoint_schedule[checkpoint_schedule_idx] == (round + 1)) {
+            should_checkpoint = true;
+            checkpoint_schedule_idx++;
+        }
+
+        if (should_checkpoint && (round + 1) < n_rounds) {
             std::string path = cp_path(round + 1);
             fprintf(stderr, "  checkpoint at round %llu (cumulative samples %llu)...\n",
                 (unsigned long long)(round + 1), (unsigned long long)samples_done_total);

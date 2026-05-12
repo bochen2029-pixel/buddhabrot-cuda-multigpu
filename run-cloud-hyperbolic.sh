@@ -29,6 +29,10 @@ N_DEVICES="${N_DEVICES:-8}"
 LAUNCHES_PER_ROUND="${LAUNCHES_PER_ROUND:-16}"
 SAMPLES_PER_THREAD="${SAMPLES_PER_THREAD:-32}"      # Linux, no TDR — bigger than Windows 8
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-117}"          # 4 saves over ~466 rounds at 2T
+# Optional: explicit non-uniform checkpoint schedule (comma-separated round
+# numbers). Combines with CHECKPOINT_EVERY (both fire independently). Leave
+# empty for uniform cadence only.
+CHECKPOINT_SCHEDULE="${CHECKPOINT_SCHEDULE:-}"
 
 # Trim values predicted from the 0.388 cross-density scaling. See README §math.
 TRIM_R="${TRIM_R:-1.00}"
@@ -200,12 +204,19 @@ cat <<EOF | tee "${OUTPUT_BASE}.launch.log"
 [launch] devices        : $N_DEVICES x $GPU_TIER
 [launch] trims          : R=$TRIM_R G=$TRIM_G B=$TRIM_B
 [launch] checkpoint_every: $CHECKPOINT_EVERY rounds
+[launch] checkpoint_sched: ${CHECKPOINT_SCHEDULE:-<none>}
 [launch] launches/round : $LAUNCHES_PER_ROUND
 [launch] samples/thread : $SAMPLES_PER_THREAD
 [launch] wallclock_cap  : ${WALLCLOCK_HARD_CAP}s (SIGUSR1 at T-${SIGUSR1_LEAD}s)
 [launch] output_base    : $OUTPUT_BASE
 [launch] hf_sync        : $HF_SYNC_ENABLED ($HF_BUCKET)
 EOF
+
+# Optional --checkpoint-schedule injection: only adds the flag if the env var is set.
+SCHEDULE_ARGS=()
+if [ -n "$CHECKPOINT_SCHEDULE" ]; then
+    SCHEDULE_ARGS=(--checkpoint-schedule "$CHECKPOINT_SCHEDULE")
+fi
 
 # Launch under supervisor watchdog
 exec ./_supervise-cloud.sh \
@@ -229,5 +240,6 @@ exec ./_supervise-cloud.sh \
         --samples-per-thread "$SAMPLES_PER_THREAD" \
         --launches-per-round "$LAUNCHES_PER_ROUND" \
         --checkpoint-every "$CHECKPOINT_EVERY" \
+        "${SCHEDULE_ARGS[@]}" \
         --output "$OUTPUT_PNG" \
         "${RESUME_ARG[@]}"

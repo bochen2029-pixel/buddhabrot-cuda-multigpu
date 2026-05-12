@@ -271,8 +271,20 @@ export TARGET_SAMPLES="${TARGET_SAMPLES:-2000000000000}"
 export TRIM_R="${TRIM_R:-0.42}"
 export TRIM_G="${TRIM_G:-0.30}"
 export TRIM_B="${TRIM_B:-0.17}"
-# Less frequent checkpoints — each .bin is 77 GB so disk + sync overhead matters
-export CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-600}"
+# Checkpoint cadence — non-uniform schedule per user spec:
+#   first 3 cps at 30-min intervals (T+30, T+60, T+90) for early validation,
+#   then 60-min intervals thereafter.
+# Schedule is in ROUNDS (round numbers based on a 22 M/s H200 throughput estimate
+# at 3.05 sec/round). If H200 actual rate differs by ±30%, cp times shift
+# proportionally but still cover the run.
+# Computed as: 590=30min, 1180=60min, 1770=90min, then +1180 (60 min) each.
+# Final schedule entry at round 25370 ≈ T+22h, before SIGUSR1 fires at 22.5h.
+#
+# CHECKPOINT_EVERY=0 disables the uniform cadence — schedule is the only path.
+# To override and use simple uniform cadence, set CHECKPOINT_EVERY=590 (30 min)
+# or CHECKPOINT_EVERY=1180 (60 min) and CHECKPOINT_SCHEDULE="".
+export CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-0}"
+export CHECKPOINT_SCHEDULE="${CHECKPOINT_SCHEDULE:-590,1180,1770,2950,4130,5310,6490,7670,8850,10030,11210,12390,13570,14750,15930,17110,18290,19470,20650,21830,23010,24190,25370}"
 export LAUNCHES_PER_ROUND="${LAUNCHES_PER_ROUND:-8}"
 export SAMPLES_PER_THREAD="${SAMPLES_PER_THREAD:-8}"
 export WALLCLOCK_HARD_CAP="${WALLCLOCK_HARD_CAP:-82800}"     # 23 hr
@@ -281,7 +293,13 @@ export OUTPUT_BASE="${OUTPUT_BASE:-buddhabrot_cloud_64k_h200_24h}"
 
 echo
 echo "[config] resolution: ${WIDTH}x${HEIGHT}  target: ${TARGET_SAMPLES} samples"
-echo "[config] cp every:   ${CHECKPOINT_EVERY} rounds  (~$((CHECKPOINT_EVERY * 559 / 6000 / 2)) min at 22 M/s est)"
+if [ "$CHECKPOINT_EVERY" -gt 0 ]; then
+    echo "[config] cp every:   ${CHECKPOINT_EVERY} rounds  (~$((CHECKPOINT_EVERY * 305 / 6000)) min at 22 M/s est)"
+fi
+if [ -n "$CHECKPOINT_SCHEDULE" ]; then
+    SCHED_COUNT=$(echo "$CHECKPOINT_SCHEDULE" | tr ',' '\n' | wc -l)
+    echo "[config] cp schedule: $SCHED_COUNT explicit rounds (first 3 every 30 min, then every 60 min)"
+fi
 echo "[config] cap:        ${WALLCLOCK_HARD_CAP}s = $((WALLCLOCK_HARD_CAP/3600)) hr"
 echo "[config] SIGUSR1 at: T+$((WALLCLOCK_HARD_CAP - SIGUSR1_LEAD))s"
 echo "[config] trims:      R=$TRIM_R G=$TRIM_G B=$TRIM_B (predicted for 64K@500 traj/px; retune post-render)"
@@ -293,6 +311,7 @@ LAUNCH_INNER="export N_DEVICES=$N_DEVICES \
        TARGET_SAMPLES=$TARGET_SAMPLES \
        TRIM_R=$TRIM_R TRIM_G=$TRIM_G TRIM_B=$TRIM_B \
        CHECKPOINT_EVERY=$CHECKPOINT_EVERY \
+       CHECKPOINT_SCHEDULE='$CHECKPOINT_SCHEDULE' \
        LAUNCHES_PER_ROUND=$LAUNCHES_PER_ROUND \
        SAMPLES_PER_THREAD=$SAMPLES_PER_THREAD \
        WALLCLOCK_HARD_CAP=$WALLCLOCK_HARD_CAP \
