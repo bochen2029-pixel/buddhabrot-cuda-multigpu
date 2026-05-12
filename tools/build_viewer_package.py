@@ -203,23 +203,33 @@ for token in Path(bin_path).stem.split("."):
     encoding="utf-8",
 )
 
+# Pick a unique port per viewer derived from cp_label so different viewers
+# don't share browser cache state. cp number → port offset in range 8000-8999.
+# This solves the common "I launched a new viewer but it shows the old one's
+# tiles" problem caused by browser caching identical tile URLs.
+try:
+    port = 8000 + (int(cp_label) % 1000)
+except (ValueError, TypeError):
+    port = 8000
+viewer_url = f"http://localhost:{port}/viewer.html"
+
 # Launch script — starts a local HTTP server and opens the browser
-launch_bat = """@echo off
-echo Starting local server on http://localhost:8000/viewer.html ...
+launch_bat = f"""@echo off
+echo Starting local server on {viewer_url} ...
 echo Press Ctrl+C to stop the server when done.
-start http://localhost:8000/viewer.html
-python -m http.server 8000
+start {viewer_url}
+python -m http.server {port}
 """
 (out_dir / "LAUNCH.bat").write_text(launch_bat, encoding="utf-8")
 
-launch_sh = """#!/usr/bin/env bash
-echo "Starting local server on http://localhost:8000/viewer.html ..."
+launch_sh = f"""#!/usr/bin/env bash
+echo "Starting local server on {viewer_url} ..."
 echo "Press Ctrl+C to stop the server when done."
-python3 -m http.server 8000 &
+python3 -m http.server {port} &
 SERVER_PID=$!
 sleep 1
-if command -v xdg-open >/dev/null; then xdg-open http://localhost:8000/viewer.html
-elif command -v open >/dev/null; then open http://localhost:8000/viewer.html
+if command -v xdg-open >/dev/null; then xdg-open {viewer_url}
+elif command -v open >/dev/null; then open {viewer_url}
 fi
 wait $SERVER_PID
 """
