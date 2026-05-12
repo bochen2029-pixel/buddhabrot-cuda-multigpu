@@ -71,7 +71,7 @@ def main():
     all_norm_B = []
     tile_meta = []
     for t in spec["tiles"]:
-        bin_path = tile_dir / f"tile_{t['id']}.bin"
+        bin_path = tile_dir / f"{t['id']}.bin"
         if not bin_path.exists():
             print(f"  WARN: {bin_path} missing, skipping")
             continue
@@ -118,8 +118,8 @@ def main():
 
     for tm in tile_meta:
         t = tm["tile"]
-        bin_path = tile_dir / f"tile_{t['id']}.bin"
-        out_tiff = out_dir / f"tile_{t['id']}.tif"
+        bin_path = tile_dir / f"{t['id']}.bin"
+        out_tiff = out_dir / f"{t['id']}.tif"
         with open(bin_path, "rb") as fh:
             hdr = read_bin_header(fh)
         h, w = hdr["height"], hdr["width"]
@@ -167,7 +167,7 @@ def main():
                 "id":  t["id"],
                 "i":   t["i"],
                 "j":   t["j"],
-                "tif": f"tile_{t['id']}.tif",
+                "tif": f"{t['id']}.tif",
             }
             for t in spec["tiles"]
         ],
