@@ -89,6 +89,12 @@ def main():
                     help="optional downsampled guide .gbin for bin-guided IMap construction. "
                          "Use tools/downsample_bin.py to produce from an existing high-quality .bin. "
                          "Concentrates IMap on visually-important regions, 1.5-3x more efficient IS.")
+    ap.add_argument("--hf-bucket", default="",
+                    help="optional HF bucket name (e.g. bochen2079/buddhabrot). When set, the "
+                         "script will start a background hf sync loop that uploads each tile's "
+                         ".bin + .png as they land on disk. Subdir on HF will match --output-dir name.")
+    ap.add_argument("--hf-sync-interval", type=int, default=60,
+                    help="seconds between background HF sync passes (default 60)")
     ap.add_argument("--apron", type=int, default=64,
                     help="overlap apron in pixels (each side). 0 = no blend (visible seams). "
                          "64+ = smooth via compose_blended.py at stitch time.")
@@ -147,6 +153,36 @@ def main():
     print(f"Wallclock est:     {n_tiles * (args.seconds_per_tile + 10) / 60:.1f} min")
     print(f"Output dir:        {out_dir.resolve()}")
     print(f"{'='*60}\n")
+
+    # --- Optionally start background HF sync loop ---
+    # Each pass uploads any new tile .bin / .png since the last sync. Tile-naming
+    # convention (rNNcMM) means each upload only includes the matching files for
+    # that tile. The loop continues until killed at end of render.
+    hf_loop_pid = None
+    if args.hf_bucket:
+        out_name = out_dir.name
+        hf_url = f"hf://buckets/{args.hf_bucket}/{out_name}/"
+        log_path = "/tmp/hf_tiles_loop.log"
+        sync_cmd = (
+            f'cd "{out_dir.resolve()}" && '
+            f'while true; do '
+            f'echo "[hf-tiles $(date -u +%H:%M:%S)] sync pass"; '
+            f'hf sync . "{hf_url}" '
+            f'--include "r*c*.bin" --include "r*c*.png" --include "tile_spec.json" '
+            f'2>&1 | tail -3; '
+            f'sleep {args.hf_sync_interval}; '
+            f'done'
+        )
+        proc = subprocess.Popen(
+            ["nohup", "bash", "-c", sync_cmd],
+            stdout=open(log_path, "wb"),
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setpgrp,  # detach from this process group
+        )
+        hf_loop_pid = proc.pid
+        print(f"[hf] background sync loop PID {hf_loop_pid}")
+        print(f"[hf] uploading to {hf_url} every {args.hf_sync_interval}s")
+        print(f"[hf] tail loop log: tail -f {log_path}\n")
 
     # --- Emit tile_spec.json (compatible with stitch_tiles.py) ---
     spec_tiles = []
@@ -301,6 +337,27 @@ def main():
     print(f"\n{'='*60}")
     print(f"DONE -- {rendered} tiles rendered, {skipped} skipped, total {total_time/60:.1f} min")
     print(f"{'='*60}\n")
+
+    # --- Final HF sync to catch any tiles uploaded mid-pass (atomic completion) ---
+    if hf_loop_pid is not None:
+        out_name = out_dir.name
+        hf_url = f"hf://buckets/{args.hf_bucket}/{out_name}/"
+        print(f"[hf] final foreground sync to catch any last tiles...")
+        subprocess.run([
+            "hf", "sync", str(out_dir.resolve()), hf_url,
+            "--include", "r*c*.bin",
+            "--include", "r*c*.png",
+            "--include", "tile_spec.json",
+        ])
+        # Stop the background sync loop
+        print(f"[hf] stopping background sync loop (PID {hf_loop_pid})")
+        try:
+            os.killpg(os.getpgid(hf_loop_pid), 15)
+        except (ProcessLookupError, OSError):
+            pass
+        print(f"[hf] all tiles uploaded. View at https://huggingface.co/buckets/{args.hf_bucket}/{out_name}/")
+        print(f"")
+
     print(f"Next: stitch tiles + compose blends, then build viewer:")
     print(f"  python tools/stitch_tiles.py --tile-dir {args.output_dir} \\")
     print(f"      --output-dir {args.output_dir}/stitched/ \\")
