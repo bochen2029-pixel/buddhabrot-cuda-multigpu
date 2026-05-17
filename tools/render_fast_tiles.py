@@ -57,6 +57,75 @@ def parse_resolution(s):
     return int(a), int(b)
 
 
+def compute_tile_order(order: str, tile_indices: list, cols: int, rows: int,
+                       guide_array, guide_W: int, guide_H: int) -> list:
+    """Reorder tile_indices according to the chosen strategy, using the guide
+    as the brightness oracle.
+
+    Strategies:
+        brightness         - DESC by guide_region_max (renders body cusp first,
+                             empty background last; best for crash resilience).
+        spiral             - ASC by distance from brightness-weighted centroid
+                             (center-out radial; assumes single bright concentration).
+        brightness-spiral  - top 25%% by brightness first (in brightness order),
+                             remainder by spiral from centroid (hybrid).
+
+    Tiles excluded from the input list (e.g. those skipped by --start-tile)
+    are not reintroduced.
+    """
+    import numpy as np
+
+    def tile_max(tile_idx: int) -> int:
+        i = tile_idx % cols
+        j = tile_idx // cols
+        gx0 = (i      * guide_W) // cols
+        gx1 = ((i + 1) * guide_W) // cols
+        gy0 = (j      * guide_H) // rows
+        gy1 = ((j + 1) * guide_H) // rows
+        return int(guide_array[gy0:gy1, gx0:gx1].max())
+
+    if order == "brightness":
+        return sorted(tile_indices, key=tile_max, reverse=True)
+
+    # Brightness-weighted centroid in guide-pixel coords, then convert to
+    # fractional tile coords. If guide is all-zero (degenerate), centroid
+    # falls back to the geometric center.
+    weights = guide_array.astype(np.float64)
+    total = weights.sum()
+    if total > 0:
+        ys, xs = np.indices(guide_array.shape)
+        cx_guide = float((xs * weights).sum() / total)
+        cy_guide = float((ys * weights).sum() / total)
+    else:
+        cx_guide = guide_W / 2.0
+        cy_guide = guide_H / 2.0
+    cx_tile = cx_guide / guide_W * cols
+    cy_tile = cy_guide / guide_H * rows
+    print(f"[order] brightness centroid: guide=({cx_guide:.1f},{cy_guide:.1f}) "
+          f"-> tile=({cx_tile:.3f},{cy_tile:.3f}) (cols={cols}, rows={rows})")
+
+    def tile_dist(tile_idx: int) -> float:
+        i = tile_idx % cols
+        j = tile_idx // cols
+        # Tile center in tile-coord space is (i+0.5, j+0.5)
+        return (i + 0.5 - cx_tile) ** 2 + (j + 0.5 - cy_tile) ** 2
+
+    if order == "spiral":
+        return sorted(tile_indices, key=tile_dist)
+
+    if order == "brightness-spiral":
+        n = len(tile_indices)
+        n_bright = max(1, n // 4)
+        by_brightness = sorted(tile_indices, key=tile_max, reverse=True)
+        bright_first = by_brightness[:n_bright]
+        bright_set = set(bright_first)
+        remaining = [t for t in tile_indices if t not in bright_set]
+        remaining_spiral = sorted(remaining, key=tile_dist)
+        return bright_first + remaining_spiral
+
+    raise ValueError(f"unknown tile-order: {order}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--grid", default="8x8", help="tile grid: cols x rows (e.g. 4x4, 8x8, 16x16)")
@@ -121,6 +190,17 @@ def main():
                          "64+ = smooth via compose_blended.py at stitch time.")
     ap.add_argument("--start-tile", type=int, default=0,
                     help="resume from this tile index (skip already-rendered tiles)")
+    ap.add_argument("--tile-order", default="naive",
+                    choices=["naive", "brightness", "spiral", "brightness-spiral"],
+                    help="tile rendering order. 'naive' (default) = row-major "
+                         "top-to-bottom left-to-right (unchanged existing behavior). "
+                         "'brightness' = sort by guide region max DESC (renders body "
+                         "cusp + bulbs first, empty background last; best for "
+                         "crash-resilience). 'spiral' = sort by distance from "
+                         "brightness-weighted centroid ASC (center-out radial). "
+                         "'brightness-spiral' = top 25%% by brightness first, then "
+                         "remainder spiral from centroid. All non-naive modes require "
+                         "--guide-bin; falls back to naive with warning if guide unavailable.")
     args = ap.parse_args()
 
     cols, rows = parse_grid(args.grid)
@@ -141,7 +221,7 @@ def main():
     guide_array = None       # 2D uint16 numpy array (lazy-loaded if needed)
     guide_W = 0
     guide_H = 0
-    if args.guide_bin and args.classify_threshold > 0:
+    if args.guide_bin and (args.classify_threshold > 0 or args.tile_order != "naive"):
         import numpy as np
         import struct as _struct
         try:
@@ -421,6 +501,26 @@ def main():
     if not tile_indices:
         print("No tiles to render (start_tile >= n_tiles).")
         return
+
+    # --- Optional: reorder tile_indices by --tile-order strategy ---
+    # Default 'naive' is row-major (unchanged behavior). Other modes use the
+    # guide to bias rendering toward visually-important tiles first; if the
+    # render is interrupted, the artifact-so-far is the bright structure not
+    # empty background. Submission-order in the ThreadPoolExecutor parallel
+    # path determines which tiles get STARTED first, so this works for both
+    # serial (num_gpus=1) and parallel (num_gpus>1) execution.
+    if args.tile_order != "naive":
+        if guide_array is None:
+            print(f"WARN: --tile-order {args.tile_order} requires --guide-bin "
+                  f"with a loadable guide; falling back to naive ordering")
+        else:
+            tile_indices = compute_tile_order(
+                args.tile_order, tile_indices, cols, rows,
+                guide_array, guide_W, guide_H,
+            )
+            preview = [f"r{t//cols:02d}c{t%cols:02d}" for t in tile_indices[:8]]
+            print(f"[order] strategy: {args.tile_order}; "
+                  f"first 8 tiles: {preview}")
 
     if args.num_gpus <= 1:
         # Serial path — preserves original ordering / progress output.
